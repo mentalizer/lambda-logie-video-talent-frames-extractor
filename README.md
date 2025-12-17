@@ -1,100 +1,100 @@
-# Video Talent Frame Extractor (Lambda)
+# Video Talent Frame Extractor
 
-A high-performance, serverless AWS Lambda function designed to extract the "best" frame of every unique person in a video. Built with **InsightFace** for detection and **DBSCAN** for deduplication.
+Extract the "best" frame of every unique person in a video using **InsightFace** AI and **DBSCAN** deduplication.
 
-## 🚀 Features
+## 🚀 Deployment Options
 
--   **Tiered Processing Logic**:
-    -   **Short Videos (< 5 min)**: Blazing fast linear scan (1 check/sec).
-    -   **Long Videos (> 5 min)**: Smart 2-Pass Optimization (Coarse Scan + Dense Refinement) to minimize compute costs on long content.
--   **Smart Deduplication**: Uses DBSCAN clustering on facial embeddings to group unique people and ignore duplicates.
--   **Quality Scoring**: Selects the best frame based on detection confidence, pose (looking at camera), and size.
--   **Standardized Output**: Automatically corrects aspect ratios to standard 1080p (1920x1080 or 1080x1920).
--   **Serverless**: Runs on AWS Lambda (Container Image) for infinite scalability.
+| Option | Speed | Best For |
+|--------|-------|----------|
+| **Modal (GPU)** ⭐ | ~10-20x faster | Production, Long Videos |
+| **Lambda (CPU)** | Slower | Low volume, Short Videos |
+
+### Recommended: Modal GPU
+
+For production use, we strongly recommend **Modal.com** for GPU-accelerated processing.
+
+👉 **See [MODAL_BLUEPRINT.md](./MODAL_BLUEPRINT.md) for the complete setup guide.**
+
+Quick start:
+```bash
+pip install modal
+modal setup
+modal secret create aws-s3-credentials AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+modal deploy modal_app.py
+```
+
+---
+
+## 🎯 Features
+
+-   **Tiered Processing**: Fast linear scan for short videos, smart 2-pass for long videos.
+-   **Smart Deduplication**: Clusters faces to identify unique people.
+-   **Quality Scoring**: Picks the best frame per person (pose, size, confidence).
+-   **Standardized Output**: 1080p resolution (1920x1080 or 1080x1920).
 
 ## 🛠️ Architecture
 
-1.  **Input**: JSON Payload `{"bucket": "my-bucket", "key": "video.mp4"}`.
-2.  **Process**:
-    -   Downloads video to `/tmp`.
-    -   analyzes frames using `insightface`.
-    -   Clusters faces to find unique identities.
-    -   Resizes and uploads the best shot for each person to S3.
-3.  **Output**: `processed/{original_filename}/person_{id}.jpg` in the source bucket.
-
-## 📦 Deployment Guide
-
-### Prerequisites
--   Docker installed.
--   AWS CLI configured with permissions for ECR and Lambda.
-
-### 1. Build & Push Docker Image
-
-```bash
-# Login to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
-
-# Build
-docker build -t video-talent-extractor .
-
-# Tag & Push
-docker tag video-talent-extractor:latest <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/video-talent-extractor:latest
-docker push <YOUR_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/video-talent-extractor:latest
+```
+Input:  {"bucket": "my-bucket", "key": "video.mp4"}
+Output: processed/{video_name}/person_{id}.jpg → Your S3 Bucket
 ```
 
-### 2. Create Lambda Function
+---
 
--   **Type**: Container Image.
--   **Memory**: 4GB - 8GB (Recommended for speed).
--   **Timeout**: 5-10 mins (depends on max video length).
--   **Ephemeral Storage**: > 512MB (Recommended 2GB+ for large video downloads).
--   **Permissions**:
-    -   `s3:GetObject` (Source bucket)
-    -   `s3:PutObject` (Source bucket)
+## 📦 Lambda Deployment (Alternative)
+
+If you prefer AWS Lambda (CPU-only):
+
+### Prerequisites
+- Docker
+- AWS CLI configured
+
+### Deploy
+
+```bash
+# Build & push to ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+docker build -t video-talent-extractor .
+docker tag video-talent-extractor:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/video-talent-extractor:latest
+docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/video-talent-extractor:latest
+```
+
+### Lambda Config
+- **Memory**: 4-8GB
+- **Timeout**: 5-10 min
+- **Permissions**: `s3:GetObject`, `s3:PutObject`
+
+---
 
 ## 🧪 Local Testing
 
-To test the logic locally without deploying, you can use a python script that mocks the Lambda context.
-
-**1. Install Dependencies locally**
-You will need C++ Build Tools (VS Code users on Windows: install "Desktop development with C++" workload).
 ```bash
+# Install deps (needs C++ build tools on Windows)
 python -m venv .venv
-source .venv/bin/activate # or .venv\Scripts\activate
+.venv\Scripts\activate  # Windows
 pip install -r requirements.txt
-```
 
-**2. Create a Run Script (`run_local.py`)**
-*Note: This file is excluded from git to keep the repo clean.*
-
-```python
-import app
-import logging
-
-# ... Mock Context ...
-event = {
-    "bucket": "test-bucket",
-    "key": "test-video.mp4"
-}
-app.lambda_handler(event, None)
-```
-
-**3. Run**
-```bash
+# Create run_local.py (not in repo)
+# Then run:
 python run_local.py
 ```
 
-## 💡 Best Practices & Configuration
+---
 
-### Memory vs Speed
-InsightFace is CPU intensive.
--   **2GB Memory**: Functional but slow (~2-3fps processing).
--   **10GB Memory**: Much faster, as Lambda allocates proportional vCPU threads (up to 6 vCPUs).
+## 📚 Documentation
 
-### Tiered Logic Customization
-The 5-minute threshold is hardcoded in `app.py`.
--   To adjust: Search for `if duration < 300:` and modify the usage.
+| File | Purpose |
+|------|---------|
+| [`MODAL_BLUEPRINT.md`](./MODAL_BLUEPRINT.md) | Complete Modal GPU setup guide |
+| `modal_app.py` | Modal implementation (GPU) |
+| `app.py` | Lambda implementation (CPU) |
+| `Dockerfile` | Lambda container config |
 
-### Model Storage
-The Dockerfile does NOT bake the models in to keep the image small (~?GB). Instead, `insightface` downloads them on first run to `/tmp`.
--   **Optimization**: Mount an **EFS** volume to `/tmp/.insightface` to persist models across cold starts, saving ~5 seconds per cold start.
+---
+
+## 💰 Cost Comparison
+
+| Platform | 10-min Video |
+|----------|--------------|
+| Modal (T4 GPU) | ~$0.01 |
+| Lambda (10GB RAM) | ~$0.05 |
