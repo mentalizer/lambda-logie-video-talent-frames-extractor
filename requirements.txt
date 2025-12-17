@@ -1,0 +1,6 @@
+boto3
+opencv-python-headless
+insightface
+onnxruntime
+numpy
+scikit-learn
