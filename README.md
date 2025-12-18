@@ -1,100 +1,83 @@
-# Video Talent Frame Extractor
+# 🎥 Video Talent Frame Extractor (Modal GPU)
 
-Extract the "best" frame of every unique person in a video using **InsightFace** AI and **DBSCAN** deduplication.
+High-performance, serverless video processing for extracting the **best** frames of people and representative shots. Powered by **NVIDIA T4 GPUs**, **InsightFace AI**, and **Modal.com**.
 
-## 🚀 Deployment Options
+---
 
-| Option | Speed | Best For |
-|--------|-------|----------|
-| **Modal (GPU)** ⭐ | ~10-20x faster | Production, Long Videos |
-| **Lambda (CPU)** | Slower | Low volume, Short Videos |
+## 🚀 Key Achievements & Features
 
-### Recommended: Modal GPU
+-   **⚡ 20x Speed Increase**: Migrated from Lambda CPU to **Modal GPU (NVIDIA T4)**. A 3-minute video processes in seconds, not minutes.
+-   **📡 Zero-Download Streaming**: Uses **S3 Presigned URLs** to stream video directly into OpenCV. No local disk space bottlenecks.
+-   **🎯 Single-Pass "Seek Scan"**: Optimized algorithm that "jumps" through frames (1 FPS) instead of linear reading. Drastically reduces network latency.
+-   **🖼️ Exact 10 Representative Frames**: Robust logic guarantees exactly 10 high-quality representative frames for any video length.
+-   **💰 Cost & Performance Tracking**: Webhook payload now includes **processing time** and **estimated GPU cost** (typically <$0.01 per run).
+-   **🤝 Smarter Clustered Detection**: Uses **DBSCAN** to group faces and pick the single best quality frame per unique person found.
 
-For production use, we strongly recommend **Modal.com** for GPU-accelerated processing.
+---
+
+## 🛠️ Quick Setup (Modal GPU)
+
+The recommended way to run this is using **Modal.com**.
+
+1.  **Install & Auth**:
+    ```bash
+    pip install modal
+    modal setup
+    ```
+2.  **Configure S3 Credentials**:
+    ```bash
+    modal secret create aws-s3-credentials AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+    ```
+3.  **Create Cache Volume** (One-time):
+    ```bash
+    modal volume create insightface-models
+    ```
+4.  **Deploy**:
+    ```bash
+    modal deploy modal_app.py
+    ```
 
 👉 **See [MODAL_BLUEPRINT.md](./MODAL_BLUEPRINT.md) for the complete setup guide.**
 
-Quick start:
-```bash
-pip install modal
-modal setup
-modal secret create aws-s3-credentials AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
-modal deploy modal_app.py
-```
-
 ---
 
-## 🎯 Features
+## 📡 API & Webhook
 
--   **Tiered Processing**: Fast linear scan for short videos, smart 2-pass for long videos.
--   **Smart Deduplication**: Clusters faces to identify unique people.
--   **Quality Scoring**: Picks the best frame per person (pose, size, confidence).
--   **Standardized Output**: 1080p resolution (1920x1080 or 1080x1920).
-
-## 🛠️ Architecture
-
-```
-Input:  {"bucket": "my-bucket", "key": "video.mp4"}
-Output: processed/{video_name}/person_{id}.jpg → Your S3 Bucket
+### Input (POST)
+```json
+{
+  "bucket": "logie-users",
+  "key": "content/account_id/content_id/video.mp4"
+}
 ```
 
----
-
-## 📦 Lambda Deployment (Alternative)
-
-If you prefer AWS Lambda (CPU-only):
-
-### Prerequisites
-- Docker
-- AWS CLI configured
-
-### Deploy
-
-```bash
-# Build & push to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
-docker build -t video-talent-extractor .
-docker tag video-talent-extractor:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/video-talent-extractor:latest
-docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/video-talent-extractor:latest
-```
-
-### Lambda Config
-- **Memory**: 4-8GB
-- **Timeout**: 5-10 min
-- **Permissions**: `s3:GetObject`, `s3:PutObject`
+### Output (Webhook)
+The results are pushed to your configured webhook (e.g., Make.com) with:
+-   **Processing Metrics**: Duration in seconds and estimated USD cost.
+-   **Video Metadata**: Resolution, FPS, and total frames.
+-   **Talent Frames**: S3 URLs for each unique person found.
+-   **Representative Frames**: Exactly 10 frames distributed across the video.
 
 ---
 
 ## 🧪 Local Testing
-
+Run a quick test from your machine targeting a remote S3 file:
 ```bash
-# Install deps (needs C++ build tools on Windows)
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-pip install -r requirements.txt
-
-# Create run_local.py (not in repo)
-# Then run:
-python run_local.py
+modal run modal_app.py --bucket "my-bucket" --key "my-video.mp4"
 ```
 
 ---
 
-## 📚 Documentation
+## 💰 Performance vs Cost
 
-| File | Purpose |
-|------|---------|
-| [`MODAL_BLUEPRINT.md`](./MODAL_BLUEPRINT.md) | Complete Modal GPU setup guide |
-| `modal_app.py` | Modal implementation (GPU) |
-| `app.py` | Lambda implementation (CPU) |
-| `Dockerfile` | Lambda container config |
+| Video Length | CPU (Lambda) | GPU (Modal T4) | Est. Cost |
+|--------------|--------------|----------------|-----------|
+| 3 Minutes    | ~2-3 Minutes | **~15 Seconds** | **$0.006** |
+| 30 Minutes   | Timeout      | **~2 Minutes**  | **$0.040** |
 
 ---
 
-## 💰 Cost Comparison
-
-| Platform | 10-min Video |
-|----------|--------------|
-| Modal (T4 GPU) | ~$0.01 |
-| Lambda (10GB RAM) | ~$0.05 |
+## 📚 Repository Map
+-   [`modal_app.py`](./modal_app.py): The core GPU logic & engine.
+-   [`MODAL_BLUEPRINT.md`](./MODAL_BLUEPRINT.md): Beginner-friendly setup guide.
+-   [`app.py`](./app.py): Legacy Lambda version (CPU-only).
