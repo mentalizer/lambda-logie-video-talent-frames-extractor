@@ -47,16 +47,22 @@ The recommended way to run this is using **Modal.com**.
 ```json
 {
   "bucket": "logie-users",
-  "key": "content/account_id/content_id/video.mp4"
+  "key": "content/account_id/content_id/video.mp4",
+  "transcript_key": "content/account_id/content_id/transcript.vtt",   // Optional
+  "custom_metadata": {                                              // Optional
+    "job_id": "123",
+    "priority": "high"
+  }
 }
 ```
 
 ### Output (Webhook)
-The results are pushed to your configured webhook (e.g., Make.com) with:
+The results include:
+-   **`custom_metadata`**: Exact copy of what you sent in the request.
+-   **`talent_frames`**:
+    -   `name`: Speaker name from VTT (or "Person X").
+    -   `context_text`: The exact sentence spoken at the frame's timestamp.
 -   **Processing Metrics**: Duration in seconds and estimated USD cost.
--   **Video Metadata**: Resolution, FPS, and total frames.
--   **Talent Frames**: S3 URLs for each unique person found.
--   **Representative Frames**: Exactly 10 frames distributed across the video.
 
 ---
 
@@ -65,6 +71,7 @@ Run a quick test from your machine targeting a remote S3 file:
 ```bash
 modal run modal_app.py --bucket "my-bucket" --key "my-video.mp4"
 ```
+E.g. .\.venv\Scripts\modal run modal_app.py --bucket "logie-users" --key "content/4b6ccb29-e5bb-46fa-a516-19eca622c258/99b829b8-0d72-423c-8ef5-118897053a98/ATR_Brush_Cleaner.mp4"
 
 ---
 

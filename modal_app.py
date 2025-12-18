@@ -1,13 +1,9 @@
-"""
-Modal GPU Implementation - Video Talent Frame Extractor
-Runs on T4 GPU for ~10-20x faster processing than Lambda CPU.
-"""
 import modal
 import os
+import shutil
+import tempfile
 
-# --- MODAL SETUP ---
-# Define container image with GPU support
-# We use a base image that's good for GPU or install the specific nvidia libraries ORT needs
+# Use debian_slim with build-time brute-force symlinking for GPU libs
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1-mesa-glx", "libglib2.0-0")
@@ -24,28 +20,23 @@ image = (
         "numpy==1.26.3",
         "fastapi",
         "httpx",
+        "webvtt-py==0.4.6",
     )
-    .env({
-        "LD_LIBRARY_PATH": "/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib"
-    })
+    .run_commands(
+        "find /usr/local/lib/python3.11/site-packages/nvidia -name '*.so*' -exec ln -sf {} /usr/lib/ \\;"
+    )
 )
 
 app = modal.App("video-talent-extractor", image=image)
-
-# Create a Volume to cache InsightFace models
 model_cache = modal.Volume.from_name("insightface-models", create_if_missing=True)
 
-# --- CORE FUNCTION ---
 @app.function(
     gpu="T4",
-    timeout=900,  # Increased to 15m for safety on very long videos
+    timeout=1200,
     secrets=[modal.Secret.from_name("aws-s3-credentials")],
     volumes={"/root/.insightface": model_cache},
 )
-def extract_frames(bucket: str, key: str) -> dict:
-    """
-    Highly optimized Single-Pass GPU processing with cost tracking.
-    """
+def extract_frames(bucket: str, key: str, transcript_key: str = None, custom_metadata: dict = None) -> dict:
     import cv2
     import boto3
     import uuid
@@ -54,21 +45,9 @@ def extract_frames(bucket: str, key: str) -> dict:
     import insightface
     from sklearn.cluster import DBSCAN
     from sklearn.preprocessing import normalize
-    import tempfile
-    import shutil
+    import glob
 
     start_perf = time.perf_counter()
-
-    # --- FORCE GPU LIBS VISIBILITY ---
-    # Symlink pip-installed nvidia libs to system path so ONNX can find them
-    import glob
-    for lib_path in glob.glob("/usr/local/lib/python3.11/site-packages/nvidia/*/lib/*.so*"):
-        try:
-            target = f"/usr/lib/x86_64-linux-gnu/{os.path.basename(lib_path)}"
-            if not os.path.exists(target):
-                os.symlink(lib_path, target)
-        except Exception as e:
-            print(f"Symlink failed for {lib_path}: {e}")
 
     # Init S3
     s3 = boto3.client(
@@ -79,232 +58,161 @@ def extract_frames(bucket: str, key: str) -> dict:
     )
 
     try:
-        # --- STREAMING URL ---
-        video_url = s3.generate_presigned_url(
-            'get_object', 
-            Params={'Bucket': bucket, 'Key': key}, 
-            ExpiresIn=3600
-        )
-
         temp_dir = tempfile.mkdtemp()
         frames_dir = os.path.join(temp_dir, "frames")
         os.makedirs(frames_dir)
 
-        # Init InsightFace (GPU enabled)
-        face_app = insightface.app.FaceAnalysis(name='buffalo_l')
-        face_app.prepare(ctx_id=0, det_size=(640, 640))
-
-        # Get video info
+        # 1. Metadata
+        print(f"Opening video: s3://{bucket}/{key}")
+        video_url = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=3600)
         cap = cv2.VideoCapture(video_url)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps if fps > 0 else 0
+        v_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        v_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
-        
-        print(f"Video: {duration:.1f}s, {total_frames} frames @ {fps:.1f} fps")
 
-        # --- OPTIMIZED SINGLE-PASS SCAN ---
-        # Dynamic stride: Faster for long videos, thorough for short ones.
-        if duration < 600:
-            stride_sec = 1.0  # 1 FPS for videos < 10m
-        elif duration < 1800:
-            stride_sec = 2.0  # 1 frame every 2s for 10-30m
-        else:
-            stride_sec = 5.0  # 1 frame every 5s for > 30m
-        
+        # 2. Download or Stream
+        active_path = video_url
+        if duration > 300:
+            print(f"Long video ({duration:.1f}s) - Downloading for high-speed seeking...")
+            local_video = os.path.join(temp_dir, "video.mp4")
+            s3.download_file(bucket, key, local_video)
+            active_path = local_video
+            print("Download complete.")
+
+        # 3. Init Face AI (GPU)
+        face_app = insightface.app.FaceAnalysis(name='buffalo_l')
+        face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+        # 4. SCAN
+        stride_sec = 1.0 if duration < 600 else (2.0 if duration < 1800 else 5.0)
         stride_frames = max(1, int(fps * stride_sec))
         all_faces = []
-
-        print(f"Single-Pass Scan: Every {stride_sec}s (stride: {stride_frames})...")
-        cap = cv2.VideoCapture(video_url)
+        print(f"Scanning every {stride_sec}s...")
+        cap = cv2.VideoCapture(active_path)
         for f_idx in range(0, total_frames, stride_frames):
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
             ret, frame = cap.read()
             if not ret: break
-            
             faces = face_app.get(frame)
             for face in faces:
                 if face.det_score < 0.6: continue
-                score = _calculate_score(face, frame)
-                # Keep if high quality or first face found
+                box, yaw, pitch, roll = face.bbox, *face.pose
+                area = (box[2] - box[0]) * (box[3] - box[1])
+                size_ratio = area / (frame.shape[0] * frame.shape[1])
+                pose_score = max(0, 100 - (abs(yaw) * 1.2 + abs(pitch) + abs(roll) / 2))
+                q_score = (face.det_score * 40) + (pose_score * 0.4) + (size_ratio * 100 * 0.2)
+                
                 path = os.path.join(frames_dir, f"{f_idx}_{uuid.uuid4().hex[:8]}.jpg")
                 cv2.imwrite(path, frame)
-                all_faces.append({'embedding': face.embedding, 'score': score, 'path': path, 'timestamp': f_idx / fps})
-        cap.release()
+                all_faces.append({'embedding': face.embedding, 'score': q_score, 'path': path, 'timestamp': f_idx / fps})
+        
+        # 5. Transcript
+        transcript_data = []
+        if transcript_key:
+            try:
+                import webvtt
+                vtt_resp = s3.get_object(Bucket=bucket, Key=transcript_key)
+                vtt_content = vtt_resp['Body'].read().decode('utf-8')
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.vtt', delete=False, encoding='utf-8') as tf:
+                    tf.write(vtt_content)
+                    vtt_path = tf.name
+                for caption in webvtt.read(vtt_path):
+                    txt = caption.text.strip().replace('\n', ' ')
+                    speaker = None
+                    if ':' in txt:
+                        parts = txt.split(':', 1)
+                        if len(parts[0]) < 40:
+                            speaker = parts[0].strip()
+                            txt = parts[1].strip()
+                    transcript_data.append({'start': caption.start_in_seconds, 'end': caption.end_in_seconds, 'speaker': speaker, 'text': txt})
+                os.remove(vtt_path)
+            except: pass
 
-        # --- REPRESENTATIVE FRAMES (Force Exactly 10) ---
-        rep_indices = set()
-        rep_indices.add(0)
-        rep_indices.add(min(29, total_frames - 1))
-        rep_indices.add(max(0, total_frames - 31))
-        rep_indices.add(max(0, total_frames - 2)) 
-        
+        def get_context(ts):
+            for e in transcript_data:
+                if e['start'] <= ts <= e['end']: return e['speaker'], e['text']
+            for e in transcript_data:
+                if abs(e['start'] - ts) < 2.0: return e['speaker'], e['text']
+            return None, None
+
+        # 6. Rep Frames (10)
+        rep_indices = set([0, min(29, total_frames-1), max(0, total_frames-31), max(0, total_frames-2)])
         if total_frames > 10:
-            dist_pts = np.linspace(30, total_frames - 31, 10).astype(int)[1:-1]
-            for p in dist_pts: rep_indices.add(int(p))
-        
-        idx = 1
-        while len(rep_indices) < 10 and idx < total_frames:
-            rep_indices.add(idx)
-            idx += 1
-        
+            for p in np.linspace(30, total_frames-31, 10).astype(int)[1:-1]: rep_indices.add(int(p))
+        while len(rep_indices) < 10 and len(rep_indices) < total_frames: rep_indices.add(len(rep_indices))
         sorted_rep = sorted(list(rep_indices))[:10]
 
-        # S3 Pathing
-        account_id, content_id = "unknown", "unknown"
+        # 7. Upload
+        results_client = boto3.client('s3')
         parts = key.split('/')
         if len(parts) >= 4 and parts[0] == 'content':
-            account_id, content_id = parts[1], parts[2]
-            output_bucket = "logie-users"
-            output_prefix = f"content/{account_id}/{content_id}/extraction-talent-frames"
+            out_prefix = f"content/{parts[1]}/{parts[2]}/extraction-talent-frames"
         else:
-            output_bucket = bucket
-            output_prefix = f"processed/{os.path.splitext(os.path.basename(key))[0]}"
-
-        s3_extra = {'ContentType': 'image/jpeg'}
-
-        # Upload Representative
+            out_prefix = f"processed/{os.path.splitext(os.path.basename(key))[0]}"
+        
         rep_results = []
-        cap = cv2.VideoCapture(video_url)
         for i, f_idx in enumerate(sorted_rep):
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
             ret, frame = cap.read()
-            if not ret: 
-                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, f_idx - 1))
-                ret, frame = cap.read()
-                if not ret: continue
-            
-            h, w = frame.shape[:2]
-            target = (1920, 1080) if w >= h else (1080, 1920)
-            resized = cv2.resize(frame, target)
+            if not ret: continue
             out_path = os.path.join(temp_dir, f"rep_{i}.jpg")
-            cv2.imwrite(out_path, resized)
-            s_key = f"{output_prefix}/representative_frame_{i}.jpg"
-            s3.upload_file(out_path, output_bucket, s_key, ExtraArgs=s3_extra)
-            rep_results.append({
-                "frame_index": f_idx, 
-                "s3_url": f"https://{output_bucket}.s3.amazonaws.com/{s_key}", 
-                "timestamp": round(f_idx / fps, 2)
-            })
-        cap.release()
+            cv2.imwrite(out_path, cv2.resize(frame, (1920, 1080) if frame.shape[1] >= frame.shape[0] else (1080, 1920)))
+            s_key = f"{out_prefix}/representative_frame_{i}.jpg"
+            results_client.upload_file(out_path, "logie-users", s_key, ExtraArgs={'ContentType': 'image/jpeg'})
+            rep_results.append({"frame_index": f_idx, "s3_url": f"https://logie-users.s3.amazonaws.com/{s_key}", "timestamp": round(f_idx / fps, 2)})
 
-        # Cluster and Upload Talent
         talent_results = []
         if all_faces:
             embeddings = normalize(np.array([f['embedding'] for f in all_faces]))
             labels = DBSCAN(eps=0.65, min_samples=3).fit(embeddings).labels_
             unique = {}
-            for i, label in enumerate(labels):
-                if label == -1: continue
-                if label not in unique or all_faces[i]['score'] > unique[label]['score']:
-                    unique[label] = all_faces[i]
-            
-            for label, data in unique.items():
+            for i, l in enumerate(labels):
+                if l != -1 and (l not in unique or all_faces[i]['score'] > unique[l]['score']): unique[l] = all_faces[i]
+            for l, data in unique.items():
+                speaker, context = get_context(data['timestamp'])
+                out_path = os.path.join(temp_dir, f"p_{l}.jpg")
                 img = cv2.imread(data['path'])
-                h, w = img.shape[:2]
-                target = (1920, 1080) if w >= h else (1080, 1920)
-                resized = cv2.resize(img, target)
-                out_path = os.path.join(temp_dir, f"p_{label}.jpg")
-                cv2.imwrite(out_path, resized)
-                s_key = f"{output_prefix}/person_{label}.jpg"
-                s3.upload_file(out_path, output_bucket, s_key, ExtraArgs=s3_extra)
+                cv2.imwrite(out_path, cv2.resize(img, (1920, 1080) if img.shape[1] >= img.shape[0] else (1080, 1920)))
+                s_key = f"{out_prefix}/person_{l}.jpg"
+                results_client.upload_file(out_path, "logie-users", s_key, ExtraArgs={'ContentType': 'image/jpeg'})
                 talent_results.append({
-                    "person_id": int(label),
-                    "s3_url": f"https://{output_bucket}.s3.amazonaws.com/{s_key}",
-                    "timestamp": round(data['timestamp'], 2),
-                    "score": round(float(data['score']), 2)
+                    "person_id": int(l), "name": speaker if speaker else f"Person {l}",
+                    "context_text": context, "s3_url": f"https://logie-users.s3.amazonaws.com/{s_key}",
+                    "timestamp": round(data['timestamp'], 2), "score": round(float(data['score']), 2)
                 })
+        cap.release()
 
-        # --- FINAL PERFORMANCE METRICS ---
-        end_perf = time.perf_counter()
-        proc_time = round(end_perf - start_perf, 2)
-        # Modal T4 pricing is ~$0.000416/sec ($1.50/hr)
-        est_cost = round(proc_time * 0.000416, 4)
-
-        final_result = {
-            "status": "success",
-            "account_id": account_id,
-            "content_id": content_id,
-            "processing_metrics": {
-                "duration_seconds": proc_time,
-                "estimated_cost_usd": est_cost,
-                "gpu_type": "NVIDIA T4"
-            },
-            "video_metadata": {
-                "duration_seconds": round(duration, 2),
-                "total_frames": total_frames,
-                "fps": round(fps, 2)
-            },
-            "talent_count": len(talent_results),
-            "talent_frames": sorted(talent_results, key=lambda x: x['person_id']),
-            "representative_frames": rep_results
+        # Final Metrics
+        proc_time = round(time.perf_counter() - start_perf, 2)
+        res = {
+            "status": "success", "account_id": parts[1] if len(parts) > 2 else "unknown", "content_id": parts[2] if len(parts) > 3 else "unknown",
+            "custom_metadata": custom_metadata, "processing_metrics": {"duration_seconds": proc_time, "estimated_cost_usd": round(proc_time * 0.000416, 4), "gpu_type": "NVIDIA T4"},
+            "video_metadata": {"duration_seconds": round(duration, 2), "total_frames": total_frames, "fps": round(fps, 2), "resolution": f"{v_w}x{v_h}"},
+            "talent_count": len(talent_results), "talent_frames": sorted(talent_results, key=lambda x: x['person_id']), "representative_frames": rep_results
         }
-
-        # Webhook
-        webhook_url = "https://hook.us1.make.com/qb8jajua119emykshhxdkl7wrbrct4cr"
-        import httpx
         try:
-            print(f"Sending webhook ({proc_time}s, ${est_cost})...")
-            httpx.post(webhook_url, json=final_result, timeout=10.0)
-        except Exception as e: print(f"Webhook error: {e}")
-        
-        return final_result
+            import httpx
+            httpx.post("https://hook.us1.make.com/qb8jajua119emykshhxdkl7wrbrct4cr", json=res, timeout=10.0)
+        except: pass
+        return res
 
     except Exception as e:
         print(f"ERROR: {str(e)}")
-        # Send failure webhook if possible
-        try:
-            import httpx
-            webhook_url = "https://hook.us1.make.com/qb8jajua119emykshhxdkl7wrbrct4cr"
-            httpx.post(webhook_url, json={"status": "error", "error": str(e), "key": key}, timeout=5.0)
-        except: pass
         raise e
-
     finally:
-        t_dir = locals().get('temp_dir')
-        if t_dir and os.path.exists(t_dir):
-            shutil.rmtree(t_dir, ignore_errors=True)
+        if 'temp_dir' in locals() and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _calculate_score(face, frame):
-    """Calculate quality score for a face."""
-    yaw, pitch, roll = face.pose
-    pose_score = max(0, 100 - (abs(yaw) * 1.2 + abs(pitch) + abs(roll) / 2))
-    box = face.bbox
-    area = (box[2] - box[0]) * (box[3] - box[1])
-    size_ratio = area / (frame.shape[0] * frame.shape[1])
-    return (face.det_score * 40) + (pose_score * 0.4) + (size_ratio * 100 * 0.2)
-
-
-# --- WEB ENDPOINT ---
 @app.function()
 @modal.fastapi_endpoint(method="POST")
 def process_video(request: dict) -> dict:
-    """
-    HTTPS Endpoint to trigger processing.
-    
-    POST Body:
-        {"bucket": "my-bucket", "key": "videos/my-video.mp4"}
-    
-    Returns:
-        Processing results with S3 URLs
-    """
-    bucket = request.get("bucket")
-    key = request.get("key")
-
-    if not bucket or not key:
-        return {"error": "Missing 'bucket' or 'key' in request"}
-
-    # Run the GPU function
-    result = extract_frames.remote(bucket, key)
-    return result
+    return extract_frames.remote(request.get("bucket"), request.get("key"), request.get("transcript_key"), request.get("custom_metadata"))
 
 
-# --- CLI ENTRYPOINT ---
 @app.local_entrypoint()
-def main(bucket: str, key: str):
-    """
-    CLI: modal run modal_app.py --bucket my-bucket --key video.mp4
-    """
-    result = extract_frames.remote(bucket, key)
-    print(result)
+def main(bucket: str, key: str, transcript: str = None):
+    print(extract_frames.remote(bucket, key, transcript))
