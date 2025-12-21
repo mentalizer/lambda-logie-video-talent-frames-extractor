@@ -108,9 +108,17 @@ curl --location 'https://mentalizer--video-only-extractor-process-video-job.moda
 ```
 
 **Auto-extraction:** The system automatically extracts:
-- **Video URL**: Uses MP4 preview from `video_preview_assets` (preferred) or falls back to HLS
+- **Video URL Priority**:
+  1. **Full MP4** constructed from `broadcast_id`: `https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/{broadcast_id}/default.jobtemplate.mp4` (preferred)
+  2. **MP4 Preview** from `video_preview_assets`
+  3. **HLS Stream** from `hls_url` (fallback)
 - **Transcript URL**: Parses VTT URL from `closed_captions` field
 - **Metadata**: Merges Amazon data with your custom metadata
+
+**URL Verification:** Test constructed URLs with:
+```bash
+curl -I "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/02c4ee7e633246e384019e387bbf6db4/default.jobtemplate.mp4"
+```
 
 ### **Output Structure:**
 ```

@@ -348,9 +348,19 @@ def process_video_job(request: dict) -> dict:
     if "amazon_data" in request:
         amazon_data = request["amazon_data"]
 
-        # Extract video URL - prefer MP4 preview over HLS
+        # Extract video URL - prefer full MP4 over preview over HLS
         video_url = None
-        if "video_preview_assets" in amazon_data and amazon_data["video_preview_assets"]:
+
+        # Try to construct full video URL from broadcast_id
+        broadcast_id = amazon_data.get("broadcast_id")
+        if broadcast_id:
+            # Amazon Live full video URL pattern
+            video_url = f"https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/{broadcast_id}/default.jobtemplate.mp4"
+            print(f"Using full video URL constructed from broadcast_id: {video_url}")
+
+        # Fallback to MP4 preview if full video URL construction fails
+        if not video_url and "video_preview_assets" in amazon_data and amazon_data["video_preview_assets"]:
+            print("Falling back to video preview assets (5-second clips)")
             # Use the first/default MP4 preview
             for asset in amazon_data["video_preview_assets"]:
                 if asset.get("mimeType") == "video/mp4" or asset.get("type") == "default":
@@ -359,7 +369,7 @@ def process_video_job(request: dict) -> dict:
             if not video_url and amazon_data["video_preview_assets"]:
                 video_url = amazon_data["video_preview_assets"][0]["url"]
 
-        # Fallback to HLS (though it may not work with OpenCV)
+        # Final fallback to HLS (though it may not work with OpenCV)
         if not video_url and "hls_url" in amazon_data:
             video_url = amazon_data["hls_url"]
             print(f"Warning: Using HLS URL {video_url} - may not work with OpenCV")
