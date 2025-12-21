@@ -24,6 +24,7 @@ image = (
         "httpx",
         "webvtt-py==0.4.6",
         "requests",
+        "m3u8",
     )
     .run_commands(
         "find /usr/local/lib/python3.11/site-packages/nvidia -name '*.so*' -exec ln -sf {} /usr/lib/ \\;"
@@ -73,15 +74,22 @@ def extract_video_frames(video_url: str, transcript_url: str = None, metadata: d
     try:
         temp_dir = tempfile.mkdtemp()
 
-        # 1. Download video
+        # 1. Download video (handle HLS streams for short videos)
         print(f"Downloading video from: {video_url}")
-        video_response = requests.get(video_url, stream=True)
-        video_response.raise_for_status()
 
-        video_path = os.path.join(temp_dir, "video.mp4")
-        with open(video_path, 'wb') as f:
-            for chunk in video_response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        if video_url.endswith('.m3u8') or 'hls' in video_url.lower():
+            print("Detected HLS stream - downloading and converting segments...")
+            video_path = download_hls_to_mp4(video_url, temp_dir)
+        else:
+            # Direct MP4 download
+            video_response = requests.get(video_url, stream=True)
+            video_response.raise_for_status()
+
+            video_path = os.path.join(temp_dir, "video.mp4")
+            with open(video_path, 'wb') as f:
+                for chunk in video_response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
         print("Video download complete.")
 
         # 2. Download transcript if provided
@@ -315,6 +323,75 @@ def extract_video_frames(video_url: str, transcript_url: str = None, metadata: d
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def download_hls_to_mp4(hls_url: str, temp_dir: str) -> str:
+    """
+    Download HLS stream and convert to MP4 for short videos (10-30 seconds).
+
+    Args:
+        hls_url: URL to the HLS .m3u8 playlist
+        temp_dir: Temporary directory to store files
+
+    Returns:
+        Path to the converted MP4 file
+    """
+    import m3u8
+    import urllib.parse
+
+    output_path = os.path.join(temp_dir, "video.mp4")
+
+    try:
+        # Download and parse HLS playlist
+        playlist_response = requests.get(hls_url)
+        playlist_response.raise_for_status()
+
+        # Parse the playlist
+        playlist = m3u8.loads(playlist_response.text)
+
+        if not playlist.segments:
+            raise ValueError("No segments found in HLS playlist")
+
+        print(f"Found {len(playlist.segments)} HLS segments to download")
+
+        # Download all segments
+        segment_files = []
+        base_url = urllib.parse.urljoin(hls_url, '.')
+
+        for i, segment in enumerate(playlist.segments):
+            segment_url = urllib.parse.urljoin(base_url, segment.uri)
+            segment_path = os.path.join(temp_dir, f"segment_{i:03d}.ts")
+
+            # Download segment
+            segment_response = requests.get(segment_url, timeout=30)
+            segment_response.raise_for_status()
+
+            with open(segment_path, 'wb') as f:
+                f.write(segment_response.content)
+
+            segment_files.append(segment_path)
+            print(f"Downloaded segment {i+1}/{len(playlist.segments)}")
+
+        # Concatenate all segments into MP4
+        print("Concatenating segments into MP4...")
+        with open(output_path, 'wb') as outfile:
+            for segment_file in segment_files:
+                with open(segment_file, 'rb') as infile:
+                    outfile.write(infile.read())
+
+        # Clean up segment files
+        for segment_file in segment_files:
+            try:
+                os.remove(segment_file)
+            except OSError:
+                pass
+
+        print(f"Successfully created MP4 from {len(segment_files)} HLS segments")
+        return output_path
+
+    except Exception as e:
+        print(f"HLS download failed: {e}")
+        raise ValueError(f"Failed to download HLS stream: {str(e)}")
+
+
 @app.function()
 @modal.fastapi_endpoint(method="POST")
 def process_video_job(request: dict) -> dict:
@@ -348,19 +425,17 @@ def process_video_job(request: dict) -> dict:
     if "amazon_data" in request:
         amazon_data = request["amazon_data"]
 
-        # Extract video URL - prefer full MP4 over preview over HLS
+        # Extract video URL - prioritize HLS for short videos (10-30 seconds)
         video_url = None
 
-        # Try to construct full video URL from broadcast_id
-        broadcast_id = amazon_data.get("broadcast_id")
-        if broadcast_id:
-            # Amazon Live full video URL pattern
-            video_url = f"https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/{broadcast_id}/default.jobtemplate.mp4"
-            print(f"Using full video URL constructed from broadcast_id: {video_url}")
+        # For short Amazon Live videos, HLS is preferred (can be downloaded quickly)
+        if "hls_url" in amazon_data and amazon_data["hls_url"]:
+            video_url = amazon_data["hls_url"]
+            print(f"Using HLS stream for short video: {video_url}")
 
-        # Fallback to MP4 preview if full video URL construction fails
+        # Fallback to MP4 preview if HLS not available
         if not video_url and "video_preview_assets" in amazon_data and amazon_data["video_preview_assets"]:
-            print("Falling back to video preview assets (5-second clips)")
+            print("Falling back to video preview assets")
             # Use the first/default MP4 preview
             for asset in amazon_data["video_preview_assets"]:
                 if asset.get("mimeType") == "video/mp4" or asset.get("type") == "default":
@@ -369,10 +444,12 @@ def process_video_job(request: dict) -> dict:
             if not video_url and amazon_data["video_preview_assets"]:
                 video_url = amazon_data["video_preview_assets"][0]["url"]
 
-        # Final fallback to HLS (though it may not work with OpenCV)
-        if not video_url and "hls_url" in amazon_data:
-            video_url = amazon_data["hls_url"]
-            print(f"Warning: Using HLS URL {video_url} - may not work with OpenCV")
+        # Final fallback: construct full video URL from broadcast_id
+        if not video_url:
+            broadcast_id = amazon_data.get("broadcast_id")
+            if broadcast_id:
+                video_url = f"https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/{broadcast_id}/default.jobtemplate.mp4"
+                print(f"Final fallback: constructed full video URL from broadcast_id: {video_url}")
 
         # Extract transcript URL from closed_captions
         transcript_url = None
