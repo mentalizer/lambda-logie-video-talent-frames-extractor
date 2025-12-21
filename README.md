@@ -65,6 +65,8 @@ modal deploy video_only_extractor.py
 ```
 
 ### **API Usage:**
+
+#### **Option 1: Direct URLs**
 ```bash
 curl --location 'https://mentalizer--video-only-extractor-process-video-job.modal.run' \
 --header 'Content-Type: application/json' \
@@ -77,6 +79,38 @@ curl --location 'https://mentalizer--video-only-extractor-process-video-job.moda
   }
 }'
 ```
+
+#### **Option 2: Amazon Live Data** ⭐ **Recommended for your use case**
+```bash
+curl --location 'https://mentalizer--video-only-extractor-process-video-job.modal.run' \
+--header 'Content-Type: application/json' \
+--data '{
+  "amazon_data": {
+    "broadcast_id": "02c4ee7e633246e384019e387bbf6db4",
+    "shop_id": "influencer-7feb78c5",
+    "broadcast_title": "Watch this preview to check it out!",
+    "hls_url": "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/97dfe7ee-b7e4-4c31-ad90-6cdae1ea6cf9/default.jobtemplate.hls.m3u8",
+    "closed_captions": "en,https://m.media-amazon.com/images/S/vse-vms-closed-captions-artifact-us-east-1-prod/closedCaptions/607dcc73-a36d-4e17-be03-a3c9de47142a.vtt",
+    "video_preview_assets": [
+      {
+        "url": "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/c8f1be9a-b050-4ed4-90b7-cf6f47cc5be0/videopreview.jobtemplate.mp4.default.mp4",
+        "type": "default",
+        "mimeType": "video/mp4"
+      }
+    ],
+    "aci_content_id": "amzn1.vse.video.02c4ee7e633246e384019e387bbf6db4",
+    "formatted_duration": "0:58"
+  },
+  "metadata": {
+    "custom_field": "additional_metadata"
+  }
+}'
+```
+
+**Auto-extraction:** The system automatically extracts:
+- **Video URL**: Uses MP4 preview from `video_preview_assets` (preferred) or falls back to HLS
+- **Transcript URL**: Parses VTT URL from `closed_captions` field
+- **Metadata**: Merges Amazon data with your custom metadata
 
 ### **Output Structure:**
 ```

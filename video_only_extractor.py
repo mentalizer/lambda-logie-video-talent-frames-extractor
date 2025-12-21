@@ -321,26 +321,86 @@ def process_video_job(request: dict) -> dict:
     """
     Simplified API endpoint for video-only processing.
 
-    Expected payload:
+    Supports multiple payload formats:
+
+    1. Direct URLs:
     {
         "video_url": "https://example.com/video.mp4",
-        "transcript_url": "https://example.com/transcript.vtt",  // optional
-        "metadata": {                                            // optional
-            "job_name": "My Video",
-            "user_id": "123",
-            "custom_field": "value"
-        }
+        "transcript_url": "https://example.com/transcript.vtt",
+        "metadata": {"job_name": "My Video"}
+    }
+
+    2. Amazon Live data:
+    {
+        "amazon_data": {
+            "broadcast_id": "02c4ee7e633246e384019e387bbf6db4",
+            "hls_url": "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/...",
+            "closed_captions": "en,https://m.media-amazon.com/images/S/vse-vms-closed-captions-artifact-us-east-1-prod/...",
+            "video_preview_assets": [{"url": "https://...", "type": "default"}],
+            ...
+        },
+        "metadata": {"shop_id": "influencer-7feb78c5", "broadcast_title": "..."}
     }
     """
-    # Validate required parameters
-    if "video_url" not in request or not request["video_url"]:
-        raise ValueError("Missing required parameter: video_url")
+    metadata = request.get("metadata", {})
 
-    return extract_video_frames.remote(
-        request["video_url"],
-        request.get("transcript_url"),
-        request.get("metadata")
-    )
+    # Handle Amazon Live data format
+    if "amazon_data" in request:
+        amazon_data = request["amazon_data"]
+
+        # Extract video URL - prefer MP4 preview over HLS
+        video_url = None
+        if "video_preview_assets" in amazon_data and amazon_data["video_preview_assets"]:
+            # Use the first/default MP4 preview
+            for asset in amazon_data["video_preview_assets"]:
+                if asset.get("mimeType") == "video/mp4" or asset.get("type") == "default":
+                    video_url = asset["url"]
+                    break
+            if not video_url and amazon_data["video_preview_assets"]:
+                video_url = amazon_data["video_preview_assets"][0]["url"]
+
+        # Fallback to HLS (though it may not work with OpenCV)
+        if not video_url and "hls_url" in amazon_data:
+            video_url = amazon_data["hls_url"]
+            print(f"Warning: Using HLS URL {video_url} - may not work with OpenCV")
+
+        # Extract transcript URL from closed_captions
+        transcript_url = None
+        if "closed_captions" in amazon_data and amazon_data["closed_captions"]:
+            # Format: "en,https://url.vtt" or just "https://url.vtt"
+            captions = amazon_data["closed_captions"]
+            if "," in captions:
+                parts = captions.split(",", 1)
+                transcript_url = parts[1] if len(parts) > 1 else parts[0]
+            else:
+                transcript_url = captions
+
+        # Merge Amazon metadata
+        if amazon_data:
+            metadata.update({
+                "broadcast_id": amazon_data.get("broadcast_id"),
+                "shop_id": amazon_data.get("shop_id"),
+                "broadcast_title": amazon_data.get("broadcast_title"),
+                "aci_content_id": amazon_data.get("aci_content_id"),
+                "reference_id": amazon_data.get("reference_id"),
+                "synopsis": amazon_data.get("synopsis"),
+                "formatted_duration": amazon_data.get("formatted_duration"),
+            })
+
+    else:
+        # Direct URL format
+        video_url = request.get("video_url")
+        transcript_url = request.get("transcript_url")
+
+    # Validate required parameters
+    if not video_url:
+        raise ValueError("Missing video URL. Provide either 'video_url' or 'amazon_data' with video assets.")
+
+    print(f"Processing video: {video_url}")
+    if transcript_url:
+        print(f"Using transcript: {transcript_url}")
+
+    return extract_video_frames.remote(video_url, transcript_url, metadata)
 
 
 @app.local_entrypoint()
