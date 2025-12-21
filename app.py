@@ -31,15 +31,21 @@ def lambda_handler(event, context):
         os.makedirs(RESULTS_DIR, exist_ok=True)
 
         bucket = event.get('bucket')
-        key = event.get('key')
-        if not bucket or not key: raise ValueError("Missing bucket/key")
+        main_folder = event.get('main_folder')
+        account_id = event.get('account_id')
+        content_id = event.get('content_id')
+        video_key = event.get('video_key')
+        transcript_key = event.get('transcript_key')
 
-        logger.info(f"Processing: s3://{bucket}/{key}")
+        if not bucket or not main_folder or not account_id or not content_id or not video_key:
+            raise ValueError("Missing required parameters: bucket, main_folder, account_id, content_id, video_key")
+
+        logger.info(f"Processing: s3://{bucket}/{video_key}")
         
         # 1. Download
         local_video_path = os.path.join(TEMP_DIR, VIDEO_FILENAME)
         logger.info("Downloading video...")
-        s3_client.download_file(bucket, key, local_video_path)
+        s3_client.download_file(bucket, video_key, local_video_path)
         
         # 2. Init Models
         # Ensure model packs are available
@@ -140,7 +146,7 @@ def lambda_handler(event, context):
             vid_cap.release()
             
             if not roi_timestamps:
-                 return {"status": "success", "processed_key": key, "faces_found": 0}
+                 return {"status": "success", "main_folder": main_folder, "account_id": account_id, "content_id": content_id, "faces_found": 0, "custom_metadata": event.get("custom_metadata")}
 
             # PASS 2: Refine
             # Limit total refinement work
@@ -245,11 +251,10 @@ def lambda_handler(event, context):
                         unique_people[label] = face_data
             
             results = []
-            base_name = os.path.splitext(os.path.basename(key))[0]
-            
+
             for label, best_face in unique_people.items():
                 src_path = best_face['file_path']
-                dst_key = f"processed/{base_name}/person_{label}.jpg"
+                dst_key = f"{main_folder}/{account_id}/{content_id}/extraction-talent-frames/person_{label}.jpg"
                 
                 img = cv2.imread(src_path)
                 if img is not None:
@@ -261,7 +266,7 @@ def lambda_handler(event, context):
                     
                     results.append({
                         "person_id": int(label),
-                        "s3_key": dst_key,
+                        "s3_url": f"https://{bucket}.s3.amazonaws.com/{dst_key}",
                         "timestamp": best_face['frame_sec'],
                         "score": best_face['score'],
                         "resolution": f"{target_w}x{target_h}"
@@ -269,9 +274,13 @@ def lambda_handler(event, context):
             
             logger.info(f"Done. Found {len(results)} unique people.")
             return {
-                "status": "success", 
-                "people_found": len(results), 
-                "results": sorted(results, key=lambda x: x['person_id'])
+                "status": "success",
+                "main_folder": main_folder,
+                "account_id": account_id,
+                "content_id": content_id,
+                "custom_metadata": event.get("custom_metadata"),
+                "talent_count": len(results),
+                "talent_frames": sorted(results, key=lambda x: x['person_id'])
             }
 
     except Exception as e:

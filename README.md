@@ -7,11 +7,13 @@ High-performance, serverless video processing for extracting the **best** frames
 ## 🚀 Key Achievements & Features
 
 -   **⚡ 20x Speed Increase**: Migrated from Lambda CPU to **Modal GPU (NVIDIA T4)**. A 3-minute video processes in seconds, not minutes.
--   **📡 Zero-Download Streaming**: Uses **S3 Presigned URLs** to stream video directly into OpenCV. No local disk space bottlenecks.
+-   **📡 Optimized Downloads**: Downloads videos from S3 for reliable processing with OpenCV. Fast and reliable metadata extraction.
 -   **🎯 Single-Pass "Seek Scan"**: Optimized algorithm that "jumps" through frames (1 FPS) instead of linear reading. Drastically reduces network latency.
 -   **🖼️ Exact 10 Representative Frames**: Robust logic guarantees exactly 10 high-quality representative frames for any video length.
 -   **💰 Cost & Performance Tracking**: Webhook payload now includes **processing time** and **estimated GPU cost** (typically <$0.01 per run).
 -   **🤝 Smarter Clustered Detection**: Uses **DBSCAN** to group faces and pick the single best quality frame per unique person found.
+-   **📁 Organized Storage**: Frames are now saved in dedicated folders using the structure `{bucket}/content/{account_id}/{content_id}/extraction-talent-frames/` to prevent overwriting between videos.
+-   **🧠 Memory Optimized**: Processes videos with minimal memory footprint, preventing resource limits on long videos.
 
 ---
 
@@ -47,11 +49,15 @@ The recommended way to run this is using **Modal.com**.
 ```json
 {
   "bucket": "logie-users",
-  "key": "content/account_id/content_id/video.mp4",
-  "transcript_key": "content/account_id/content_id/transcript.vtt",   // Optional
+  "main_folder": "content",
+  "account_id": "4b6ccb29-e5bb-46fa-a516-19eca622c258",
+  "content_id": "webinars/12-20-2025/81080519584-audio_transcript",
+  "video_key": "content/4b6ccb29-e5bb-46fa-a516-19eca622c258/webinars/12-20-2025/81080519584-video.mp4",
+  "transcript_key": "content/4b6ccb29-e5bb-46fa-a516-19eca622c258/webinars/12-20-2025/81080519584-audio_transcript.VTT",   // Optional
   "custom_metadata": {                                              // Optional
     "job_id": "123",
-    "priority": "high"
+    "priority": "high",
+    "youtube_video_id": "abc123"
   }
 }
 ```
@@ -69,18 +75,28 @@ The results include:
 ## 🧪 Local Testing
 Run a quick test from your machine targeting a remote S3 file:
 ```bash
-modal run modal_app.py --bucket "my-bucket" --key "my-video.mp4"
+modal run modal_app.py --bucket "my-bucket" --main_folder "content" --account_id "account-uuid" --content_id "content-uuid" --video_key "path/to/video.mp4"
 ```
-E.g. .\.venv\Scripts\modal run modal_app.py --bucket "logie-users" --key "content/4b6ccb29-e5bb-46fa-a516-19eca622c258/99b829b8-0d72-423c-8ef5-118897053a98/ATR_Brush_Cleaner.mp4"
+E.g. .\.venv\Scripts\modal run modal_app.py --bucket "logie-users" --main_folder "content" --account_id "4b6ccb29-e5bb-46fa-a516-19eca622c258" --content_id "webinars/12-20-2025/81080519584-audio_transcript" --video_key "content/4b6ccb29-e5bb-46fa-a516-19eca622c258/webinars/12-20-2025/81080519584-video.mp4"
 
 ---
 
 ## 💰 Performance vs Cost
 
-| Video Length | CPU (Lambda) | GPU (Modal T4) | Est. Cost |
-|--------------|--------------|----------------|-----------|
-| 3 Minutes    | ~2-3 Minutes | **~15 Seconds** | **$0.006** |
-| 30 Minutes   | Timeout      | **~2 Minutes**  | **$0.040** |
+| Video Length | CPU (Lambda) | GPU (Modal T4) | Est. Cost | Max Timeout | Memory Usage |
+|--------------|--------------|----------------|-----------|------------|-------------|
+| 3 Minutes    | ~2-3 Minutes | **~15 Seconds** | **$0.006** | 1 Hour     | Low         |
+| 30 Minutes   | Timeout      | **~2 Minutes**  | **$0.040** | 1 Hour     | Medium      |
+| 90 Minutes   | N/A          | **~15 Minutes** | **$0.200** | 1 Hour     | Optimized   |
+
+---
+
+## ⚠️ **Modal Limits & Timeouts:**
+
+- **Function Timeout:** 1 hour maximum per function call
+- **Free Tier:** Limited GPU hours per month
+- **Paid Tier:** Higher limits available
+- **For very long videos:** Consider splitting into segments or upgrading your Modal plan
 
 ---
 
