@@ -81,6 +81,15 @@ curl --location 'https://mentalizer--video-only-extractor-process-video-job.moda
 ```
 
 #### **Option 2: Amazon Live Data** ⭐ **Recommended for your use case**
+
+#### **HLS Testing Endpoint:**
+```bash
+curl --location 'https://mentalizer--video-only-extractor-test-hls-url.modal.run' \
+--header 'Content-Type: application/json' \
+--data '{"hls_url": "YOUR_HLS_URL_HERE"}'
+```
+
+**Returns:** HLS playlist info and segment accessibility status.
 ```bash
 curl --location 'https://mentalizer--video-only-extractor-process-video-job.modal.run' \
 --header 'Content-Type: application/json' \
@@ -116,6 +125,11 @@ curl --location 'https://mentalizer--video-only-extractor-process-video-job.moda
 - **Metadata**: Merges Amazon data with your custom metadata
 
 **HLS Processing:** Short HLS streams are automatically downloaded and converted to MP4 for OpenCV compatibility.
+
+**Troubleshooting HLS:**
+- Use the test endpoint above to verify HLS URL accessibility
+- Check logs for detailed error messages and fallback attempts
+- HLS downloads include automatic fallback to direct URL access
 
 **URL Verification:** Test constructed URLs with:
 ```bash

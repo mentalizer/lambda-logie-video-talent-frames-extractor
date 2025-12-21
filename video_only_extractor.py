@@ -78,11 +78,30 @@ def extract_video_frames(video_url: str, transcript_url: str = None, metadata: d
         print(f"Downloading video from: {video_url}")
 
         if video_url.endswith('.m3u8') or 'hls' in video_url.lower():
-            print("Detected HLS stream - downloading and converting segments...")
-            video_path = download_hls_to_mp4(video_url, temp_dir)
+            try:
+                print("Detected HLS stream - attempting to download and convert segments...")
+                video_path = download_hls_to_mp4(video_url, temp_dir)
+            except Exception as hls_error:
+                print(f"HLS download failed: {hls_error}")
+                print("Attempting direct download of HLS URL as fallback...")
+
+                # Fallback: try downloading the HLS URL directly (sometimes works)
+                try:
+                    hls_response = requests.get(video_url, stream=True, timeout=30)
+                    hls_response.raise_for_status()
+
+                    video_path = os.path.join(temp_dir, "video.mp4")
+                    with open(video_path, 'wb') as f:
+                        for chunk in hls_response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                    print("Direct HLS download succeeded as fallback")
+                except Exception as direct_error:
+                    print(f"Direct HLS download also failed: {direct_error}")
+                    raise ValueError(f"Both HLS parsing and direct download failed. HLS Error: {hls_error}, Direct Error: {direct_error}")
         else:
             # Direct MP4 download
-            video_response = requests.get(video_url, stream=True)
+            video_response = requests.get(video_url, stream=True, timeout=30)
             video_response.raise_for_status()
 
             video_path = os.path.join(temp_dir, "video.mp4")
@@ -340,15 +359,33 @@ def download_hls_to_mp4(hls_url: str, temp_dir: str) -> str:
     output_path = os.path.join(temp_dir, "video.mp4")
 
     try:
+        print(f"Starting HLS download from: {hls_url}")
+
         # Download and parse HLS playlist
-        playlist_response = requests.get(hls_url)
+        print("Downloading HLS playlist...")
+        playlist_response = requests.get(hls_url, timeout=10)
         playlist_response.raise_for_status()
+        print(f"Playlist downloaded, {len(playlist_response.text)} characters")
 
         # Parse the playlist
+        print("Parsing HLS playlist...")
         playlist = m3u8.loads(playlist_response.text)
 
         if not playlist.segments:
-            raise ValueError("No segments found in HLS playlist")
+            print("No segments found in playlist, checking if it's a variant playlist...")
+            # Check if it's a variant playlist (multiple quality options)
+            if playlist.playlists:
+                print(f"Found {len(playlist.playlists)} quality variants, using first one")
+                # Use the first (usually highest quality) variant
+                variant_url = urllib.parse.urljoin(hls_url, playlist.playlists[0].uri)
+                print(f"Downloading variant playlist: {variant_url}")
+                variant_response = requests.get(variant_url, timeout=10)
+                variant_response.raise_for_status()
+                playlist = m3u8.loads(variant_response.text)
+                hls_url = variant_url  # Update base URL for segments
+
+        if not playlist.segments:
+            raise ValueError(f"No segments found in HLS playlist. Content: {playlist_response.text[:500]}")
 
         print(f"Found {len(playlist.segments)} HLS segments to download")
 
@@ -360,22 +397,37 @@ def download_hls_to_mp4(hls_url: str, temp_dir: str) -> str:
             segment_url = urllib.parse.urljoin(base_url, segment.uri)
             segment_path = os.path.join(temp_dir, f"segment_{i:03d}.ts")
 
-            # Download segment
-            segment_response = requests.get(segment_url, timeout=30)
-            segment_response.raise_for_status()
+            try:
+                # Download segment
+                segment_response = requests.get(segment_url, timeout=15)
+                segment_response.raise_for_status()
 
-            with open(segment_path, 'wb') as f:
-                f.write(segment_response.content)
+                with open(segment_path, 'wb') as f:
+                    f.write(segment_response.content)
 
-            segment_files.append(segment_path)
-            print(f"Downloaded segment {i+1}/{len(playlist.segments)}")
+                segment_files.append(segment_path)
+                print(f"Downloaded segment {i+1}/{len(playlist.segments)} ({len(segment_response.content)} bytes)")
+
+            except Exception as seg_e:
+                print(f"Failed to download segment {i+1}: {segment_url} - {seg_e}")
+                # Continue with other segments if possible
+                continue
+
+        if not segment_files:
+            raise ValueError("Failed to download any HLS segments")
 
         # Concatenate all segments into MP4
-        print("Concatenating segments into MP4...")
+        print(f"Concatenating {len(segment_files)} segments into MP4...")
         with open(output_path, 'wb') as outfile:
             for segment_file in segment_files:
                 with open(segment_file, 'rb') as infile:
                     outfile.write(infile.read())
+
+        # Verify the output file
+        if os.path.getsize(output_path) == 0:
+            raise ValueError("Created MP4 file is empty")
+
+        print(f"Successfully created MP4 ({os.path.getsize(output_path)} bytes) from {len(segment_files)} HLS segments")
 
         # Clean up segment files
         for segment_file in segment_files:
@@ -384,11 +436,12 @@ def download_hls_to_mp4(hls_url: str, temp_dir: str) -> str:
             except OSError:
                 pass
 
-        print(f"Successfully created MP4 from {len(segment_files)} HLS segments")
         return output_path
 
     except Exception as e:
         print(f"HLS download failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise ValueError(f"Failed to download HLS stream: {str(e)}")
 
 
@@ -488,6 +541,59 @@ def process_video_job(request: dict) -> dict:
         print(f"Using transcript: {transcript_url}")
 
     return extract_video_frames.remote(video_url, transcript_url, metadata)
+
+
+@app.function()
+@modal.fastapi_endpoint(method="POST")
+def test_hls_url(request: dict) -> dict:
+    """
+    Test endpoint to debug HLS URL accessibility.
+
+    Payload: {"hls_url": "https://example.com/playlist.m3u8"}
+    """
+    hls_url = request.get("hls_url")
+    if not hls_url:
+        return {"error": "Missing hls_url parameter"}
+
+    try:
+        # Test playlist accessibility
+        response = requests.get(hls_url, timeout=10)
+        response.raise_for_status()
+
+        # Try to parse as M3U8
+        import m3u8
+        playlist = m3u8.loads(response.text)
+
+        result = {
+            "playlist_accessible": True,
+            "playlist_size": len(response.text),
+            "is_variant_playlist": len(playlist.playlists) > 0,
+            "segment_count": len(playlist.segments) if playlist.segments else 0,
+            "variant_count": len(playlist.playlists) if playlist.playlists else 0
+        }
+
+        # Test first segment if available
+        if playlist.segments:
+            import urllib.parse
+            base_url = urllib.parse.urljoin(hls_url, '.')
+            first_segment_url = urllib.parse.urljoin(base_url, playlist.segments[0].uri)
+
+            try:
+                segment_response = requests.head(first_segment_url, timeout=5)
+                result["first_segment_accessible"] = segment_response.status_code == 200
+                result["first_segment_url"] = first_segment_url
+            except Exception as seg_e:
+                result["first_segment_error"] = str(seg_e)
+                result["first_segment_url"] = first_segment_url
+
+        return result
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "playlist_accessible": False,
+            "hls_url": hls_url
+        }
 
 
 @app.local_entrypoint()
