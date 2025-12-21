@@ -2,6 +2,11 @@
 
 High-performance, serverless video processing for extracting the **best** frames of people and representative shots. Powered by **NVIDIA T4 GPUs**, **InsightFace AI**, and **Modal.com**.
 
+## 📋 **Available Versions:**
+
+- **`modal_app.py`** - Full-featured version with account/content folder organization
+- **`video_only_extractor.py`** - **NEW!** Simplified job-based version with date/UUID organization
+
 ---
 
 ## 🚀 Key Achievements & Features
@@ -40,6 +45,54 @@ The recommended way to run this is using **Modal.com**.
     ```
 
 👉 **See [MODAL_BLUEPRINT.md](./MODAL_BLUEPRINT.md) for the complete setup guide.**
+
+---
+
+## 🎯 **Video-Only Extractor (NEW!)**
+
+Simplified job-based version perfect for straightforward video processing.
+
+### **Features:**
+- ✅ Direct video/transcript URLs (no S3 keys required)
+- ✅ Job-based organization: `extracted-frames/{date}/{job_uuid}/`
+- ✅ Easy searching by date or job ID
+- ✅ Memory optimized for reliability
+- ✅ Same AI processing power
+
+### **Quick Deploy:**
+```bash
+modal deploy video_only_extractor.py
+```
+
+### **API Usage:**
+```bash
+curl --location 'https://mentalizer--video-only-extractor-process-video-job.modal.run' \
+--header 'Content-Type: application/json' \
+--data '{
+  "video_url": "https://example.com/video.mp4",
+  "transcript_url": "https://example.com/transcript.vtt",
+  "metadata": {
+    "job_name": "My Webinar",
+    "user_id": "12345"
+  }
+}'
+```
+
+### **Output Structure:**
+```
+logie-users/extracted-frames/
+├── 2024-12-20/
+│   ├── abc123-def456-789/
+│   │   ├── person_0.jpg
+│   │   ├── person_1.jpg
+│   │   └── representative_frame_0.jpg
+│   └── def789-ghi012-345/
+│       └── person_0.jpg
+└── 2024-12-21/
+    └── ...
+```
+
+**Perfect for:** Simple video processing without complex folder hierarchies.
 
 ---
 
@@ -101,6 +154,7 @@ E.g. .\.venv\Scripts\modal run modal_app.py --bucket "logie-users" --main_folder
 ---
 
 ## 📚 Repository Map
--   [`modal_app.py`](./modal_app.py): The core GPU logic & engine.
+-   [`modal_app.py`](./modal_app.py): Full-featured version with account/content organization.
+-   [`video_only_extractor.py`](./video_only_extractor.py): **NEW!** Simplified job-based version.
 -   [`MODAL_BLUEPRINT.md`](./MODAL_BLUEPRINT.md): Beginner-friendly setup guide.
 -   [`app.py`](./app.py): Legacy Lambda version (CPU-only).
