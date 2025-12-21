@@ -1,5 +1,14 @@
 # 🎥 Video Talent Frame Extractor (Modal GPU)
 
+
+#######
+
+FINAL MAIN FILE IS BY GOOGLE GEMINI:
+main.py
+
+#######
+
+
 High-performance, serverless video processing for extracting the **best** frames of people and representative shots. Powered by **NVIDIA T4 GPUs**, **InsightFace AI**, and **Modal.com**.
 
 ## 📋 **Available Versions:**
@@ -58,6 +67,7 @@ Simplified job-based version perfect for straightforward video processing.
 - ✅ Easy searching by date or job ID
 - ✅ Memory optimized for reliability
 - ✅ Same AI processing power
+- ✅ **Full video archiving** to `logie-users/amazon-shorts/` folder
 
 ### **Quick Deploy:**
 ```bash
@@ -81,6 +91,10 @@ curl --location 'https://mentalizer--video-only-extractor-process-video-job.moda
 ```
 
 #### **Option 2: Amazon Live Data** ⭐ **Recommended for your use case**
+
+### **GPU Acceleration** 🚀
+
+This version is configured to run on **NVIDIA T4 GPUs** for maximum speed. Face detection should process videos in **seconds rather than minutes**. If you see CPU fallback warnings in the logs, the GPU libraries may need adjustment.
 
 #### **HLS Testing Endpoint:**
 ```bash
@@ -125,6 +139,8 @@ curl --location 'https://mentalizer--video-only-extractor-process-video-job.moda
 - **Metadata**: Merges Amazon data with your custom metadata
 
 **HLS Processing:** Short HLS streams are automatically downloaded and converted to MP4 for OpenCV compatibility.
+
+**Video Archiving:** Full processed videos are archived to `logie-users/amazon-shorts/{date}/` for future reuse.
 
 **Troubleshooting HLS:**
 - Use the test endpoint above to verify HLS URL accessibility
