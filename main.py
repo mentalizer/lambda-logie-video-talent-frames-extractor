@@ -46,6 +46,61 @@ image = (
 app = modal.App("video-extractor-final", image=image)
 model_cache = modal.Volume.from_name("insightface-models", create_if_missing=True)
 
+
+def cluster_identities(embeddings):
+    """
+    Group L2-normalized face embeddings (one per sampled face) into unique people.
+
+    Distances are euclidean on unit vectors, where d = sqrt(2 - 2*cos_sim), so
+    EPS 1.0 == cosine similarity 0.5 — the standard identity threshold for
+    ArcFace-family embeddings (Immich ships cosine distance 0.5 as its default).
+    The old eps=0.65 demanded cos_sim >= 0.79 between samples, which split the
+    same person across pose/lighting/blur changes into multiple "talents".
+
+    Three passes:
+      1. Core DBSCAN (min_samples=3) finds well-supported people.
+      2. Noise points get re-assigned to the nearest person centroid within
+         EPS, so borderline samples of a found person don't vanish.
+      3. Remaining noise is clustered among itself (min_samples=2), so a person
+         on screen only briefly (2+ samples) still becomes a person instead of
+         being deleted. True singletons (one blink, one passer-by, one bad
+         detection) stay dropped.
+
+    Returns an int label per embedding; -1 = dropped.
+    """
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+
+    EPS = 1.0  # euclidean on unit vectors == cosine similarity 0.5
+
+    labels = DBSCAN(eps=EPS, min_samples=3, metric='euclidean').fit(embeddings).labels_
+
+    # Pass 2: rescue noise samples that clearly belong to a found person.
+    cluster_ids = sorted(set(labels) - {-1})
+    if cluster_ids:
+        centroids = []
+        for cid in cluster_ids:
+            c = embeddings[labels == cid].mean(axis=0)
+            centroids.append(c / np.linalg.norm(c))
+        centroids = np.array(centroids)
+        for i in np.where(labels == -1)[0]:
+            dists = np.linalg.norm(centroids - embeddings[i], axis=1)
+            nearest = int(dists.argmin())
+            if dists[nearest] <= EPS:
+                labels[i] = cluster_ids[nearest]
+
+    # Pass 3: promote brief appearances (2+ mutually-close leftover samples).
+    leftover = np.where(labels == -1)[0]
+    if len(leftover) >= 2:
+        sub_labels = DBSCAN(eps=EPS, min_samples=2, metric='euclidean').fit(embeddings[leftover]).labels_
+        next_id = (max(cluster_ids) + 1) if cluster_ids else 0
+        for sub_id in sorted(set(sub_labels) - {-1}):
+            for i in leftover[sub_labels == sub_id]:
+                labels[i] = next_id
+            next_id += 1
+
+    return labels
+
 # -----------------------------------------------------------------------------
 # UNIFIED FUNCTION (GPU + WEB ENDPOINT)
 # -----------------------------------------------------------------------------
@@ -54,8 +109,9 @@ model_cache = modal.Volume.from_name("insightface-models", create_if_missing=Tru
     timeout=3600,
     secrets=[modal.Secret.from_name("aws-s3-credentials")],
     volumes={"/root/.insightface": model_cache},
-    container_idle_timeout=120,
-    allow_concurrent_inputs=1,
+    # modal >= 1.0: container_idle_timeout was renamed to scaledown_window,
+    # and allow_concurrent_inputs=1 is the default (removed).
+    scaledown_window=120,
 )
 @modal.fastapi_endpoint(method="POST")
 def process(request: dict) -> dict:
@@ -67,7 +123,6 @@ def process(request: dict) -> dict:
     import numpy as np
     import insightface
     import onnxruntime
-    from sklearn.cluster import DBSCAN
     from sklearn.preprocessing import normalize
     import requests
     import webvtt
@@ -256,7 +311,7 @@ def process(request: dict) -> dict:
         if all_faces:
             print(f"🧠 Clustering {len(all_faces)} faces...")
             feats = normalize(np.array([f['embedding'] for f in all_faces]))
-            labels = DBSCAN(eps=0.65, min_samples=3).fit(feats).labels_
+            labels = cluster_identities(feats)
             
             unique = {}
             for i, l in enumerate(labels):

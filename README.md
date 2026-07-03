@@ -172,7 +172,11 @@ logie-users/extracted-frames/
 
 ## 📡 API & Webhook
 
-### Input (POST)
+### Endpoint
+**POST** `https://mentalizer--video-talent-extractor-process-video.modal.run`
+
+### Authentication
+Currently, the endpoint is **public** for ease of integration with your webhooks. If you require a `Bearer` token or `X-API-Key` header for production security, we can easily add a validation decorator.
 ```json
 {
   "bucket": "logie-users",
