@@ -11,7 +11,11 @@ image = (
         "insightface==0.7.3",
         "onnxruntime-gpu==1.16.3",
         "nvidia-cuda-runtime-cu11",
-        "nvidia-cudnn-cu11",
+        # PINNED: onnxruntime-gpu 1.16.x dlopens libcudnn.so.8. Unpinned,
+        # pip now resolves nvidia-cudnn-cu11 to cuDNN 9 (libcudnn.so.9) and
+        # every inference silently falls back to CPUExecutionProvider —
+        # ~10x slower scans on an idle, still-billed T4.
+        "nvidia-cudnn-cu11==8.9.5.29",
         "nvidia-cublas-cu11",
         "nvidia-cuda-nvrtc-cu11",
         "opencv-python-headless==4.9.0.80",
@@ -194,14 +198,16 @@ def extract_frames(bucket: str, main_folder: str, account_id: str, content_id: s
         duration = total_frames / fps if fps > 0 else 0
 
         # 3. Init Face AI (GPU) - Optimized for memory efficiency
-        try:
-            face_app = insightface.app.FaceAnalysis(name='buffalo_l')
-            face_app.prepare(ctx_id=0, det_size=(320, 320))  # Smaller detection size for memory efficiency
-            print("Using GPU for face detection")
-        except Exception as e:
-            print(f"GPU failed, falling back to CPU: {e}")
-            face_app = insightface.app.FaceAnalysis(name='buffalo_l')
-            face_app.prepare(ctx_id=-1, det_size=(320, 320))  # Smaller size for CPU too
+        # NOTE: insightface does NOT raise when CUDA is unavailable — onnxruntime
+        # silently applies CPUExecutionProvider. Check the provider list for the
+        # truth instead of trusting the absence of an exception.
+        import onnxruntime
+        gpu_inference = 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
+        if not gpu_inference:
+            print("*** CRITICAL: CUDAExecutionProvider unavailable — inference will run on CPU (slow) ***")
+        face_app = insightface.app.FaceAnalysis(name='buffalo_l')
+        face_app.prepare(ctx_id=0 if gpu_inference else -1, det_size=(320, 320))  # Smaller detection size for memory efficiency
+        print(f"Face detection provider: {'GPU (CUDA)' if gpu_inference else 'CPU FALLBACK'}")
 
         # 4. Find talent candidates
         all_faces = []
@@ -346,7 +352,7 @@ def extract_frames(bucket: str, main_folder: str, account_id: str, content_id: s
         proc_time = round(time.perf_counter() - start_perf, 2)
         res = {
             "status": "success", "account_id": account_id, "content_id": content_id, "mode": mode,
-            "custom_metadata": custom_metadata, "processing_metrics": {"duration_seconds": proc_time, "estimated_cost_usd": round(proc_time * 0.000416, 4), "gpu_type": "NVIDIA T4"},
+            "custom_metadata": custom_metadata, "processing_metrics": {"duration_seconds": proc_time, "estimated_cost_usd": round(proc_time * 0.000416, 4), "gpu_type": "NVIDIA T4", "gpu_inference": gpu_inference},
             "video_metadata": {"duration_seconds": round(duration, 2), "total_frames": total_frames, "fps": round(fps, 2), "resolution": f"{v_w}x{v_h}"},
             "talent_count": len(talent_results), "talent_frames": sorted(talent_results, key=lambda x: x['person_id']), "representative_frames": rep_results
         }
