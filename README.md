@@ -3,10 +3,82 @@
 
 #######
 
-FINAL MAIN FILE IS BY GOOGLE GEMINI:
-main.py
+FINAL MAIN FILE (deploy this one):
+main.py  →  `modal deploy main.py`
 
 #######
+
+## ✨ What main.py does now
+
+- **Top-3 talent images per person** — every unique person gets up to 3 quality-ranked
+  images (`person_0.jpg`, `person_0_alt1.jpg`, `person_0_alt2.jpg`), each from a
+  distinct moment in the video. The response also includes `best_talent_images`
+  (the 3 best images of the primary talent) for easy consumption.
+- **Real quality scoring** — frames are ranked by a composite of face sharpness
+  (Laplacian), head pose frontal-ness (3D landmarks), face size, exposure, and
+  detector confidence — not detector confidence alone.
+- **Primary talent detection** — `person_0` is always the person with the most
+  screen time (`is_primary: true`, plus `appearances` / `screen_time_seconds`).
+- **Fast single-pass scan** — one sequential decode pass using `grab()`/`retrieve()`
+  instead of thousands of random seeks; representative frames are captured in the
+  same pass. Models load once per container and are reused across warm requests.
+- **Whisper transcription (GPU, parallel)** — if a video has no VTT captions, audio
+  is transcribed with faster-whisper `large-v3` on the same T4, **in a background
+  thread overlapped with the face scan** so it adds ~zero wall-clock time. Control
+  it per request: `"whisper": "auto" | "always" | "never"`,
+  `"whisper_model": "large-v3"`, `"language": "en"`. Full transcript is uploaded
+  as `transcript.json`.
+- **No more stretched images** — output frames keep their aspect ratio
+  (long side 1920) instead of being forced to 1920×1080.
+
+### New request options (all optional)
+
+```json
+{
+  "video_url": "https://.../video.mp4",
+  "whisper": "auto",
+  "whisper_model": "large-v3",
+  "language": "en",
+  "max_talent_images": 3
+}
+```
+
+## ☁️ Cloudflare R2 (replaces hardcoded S3)
+
+`main.py` reads object storage from the `object-storage-credentials` Modal secret:
+
+```bash
+modal secret create object-storage-credentials \
+  OBJECT_STORAGE_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+  OBJECT_STORAGE_PUBLIC_BASE_URL=https://<pub-xxxx.r2.dev or custom domain> \
+  OBJECT_STORAGE_BUCKET=<default-bucket> \
+  OBJECT_STORAGE_ACCESS_KEY_ID=<R2 API token key id> \
+  OBJECT_STORAGE_SECRET_ACCESS_KEY=<R2 API token secret>
+```
+
+If `OBJECT_STORAGE_ENDPOINT_URL` is unset the code falls back to plain AWS S3
+(old behavior). All returned URLs are built from `OBJECT_STORAGE_PUBLIC_BASE_URL`.
+
+### R2-native requests: process a file already in the bucket
+
+Send `bucket` + `location` + `filename` instead of `video_url` — the video is read
+via the S3 API (no public URL needed) and all outputs land **in the same folder**,
+prefixed with the video's name:
+
+```json
+{
+  "bucket": "logie-users",
+  "location": "content/acc-123/vid-42",
+  "filename": "video.mp4"
+}
+```
+
+Produces `content/acc-123/vid-42/video_person_0.jpg`, `video_person_0_alt1.jpg`,
+`video_transcript.json`, … next to the source video. Representative frames are
+**skipped by default in this mode** for speed — request them with
+`"representative_frames": 10`. Legacy `video_url`/`amazon_data` requests keep
+the old `extracted-frames/{date}/{job_id}/` layout, filenames, and 10
+representative frames, so existing Make.com flows are unaffected.
 
 
 High-performance, serverless video processing for extracting the **best** frames of people and representative shots. Powered by **NVIDIA T4 GPUs**, **InsightFace AI**, and **Modal.com**.
