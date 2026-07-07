@@ -75,6 +75,20 @@ app = modal.App("video-extractor-final", image=image)
 model_cache = modal.Volume.from_name("insightface-models", create_if_missing=True)
 whisper_cache = modal.Volume.from_name("whisper-models", create_if_missing=True)
 
+# faster-whisper model used for warm-up preload + transcription.
+# NOTE: this image pins faster-whisper==0.10.1 / ctranslate2==3.24.0 (CUDA 11.8,
+# to coexist with InsightFace's onnxruntime-gpu 1.16.3). That version CANNOT load
+# large-v3-turbo (released later -> 500). distil-large-v3 (CT2) DOES load here and
+# is ~2x faster than large-v3 on short clips (whisper 8.6s -> 4.6s measured), with
+# near-identical English accuracy and fewer hallucinations.
+# ENGLISH-ONLY — the transcript path auto-routes non-English audio to
+# MULTILINGUAL_WHISPER_MODEL below, so this stays the fast English default.
+DEFAULT_WHISPER_MODEL = "Systran/faster-distil-whisper-large-v3"
+# Non-English fallback (distil is English-only) + a cheap multilingual model used
+# only to detect the language before choosing the transcription model.
+MULTILINGUAL_WHISPER_MODEL = "large-v3"
+LANG_DETECT_MODEL = "base"
+
 
 def cluster_identities(embeddings):
     """
@@ -137,8 +151,9 @@ def cluster_identities(embeddings):
 # costs 5-10s on every call.
 # -----------------------------------------------------------------------------
 _FACE_APP = None
-_WHISPER = None
-_WHISPER_NAME = None
+_WHISPER_MODELS = {}    # name -> WhisperModel; several coexist (distil + large-v3 + detector)
+_WHISPER_LOAD_S = None  # seconds the last NEW Whisper load took (warm/cold verification)
+_COLD = True            # flipped False after this container serves its first real request
 
 
 def _get_face_app():
@@ -162,18 +177,277 @@ def _get_face_app():
 
 
 def _get_whisper(model_name):
-    global _WHISPER, _WHISPER_NAME
-    if _WHISPER is None or _WHISPER_NAME != model_name:
+    """Load + cache a faster-whisper model by name. Multiple models coexist
+    (English distil + multilingual large-v3 + the language detector) so routing
+    between them never evicts/reloads. All fit a 16GB T4 alongside InsightFace."""
+    global _WHISPER_LOAD_S
+    if model_name not in _WHISPER_MODELS:
         from faster_whisper import WhisperModel
         print(f"🎙️ Loading Whisper '{model_name}' on GPU...")
-        _WHISPER = WhisperModel(
+        _t = time.perf_counter()
+        _WHISPER_MODELS[model_name] = WhisperModel(
             model_name,
             device="cuda",
             compute_type="int8_float16",  # T4-friendly: fast + fits easily in 16GB
             download_root="/root/.cache/whisper",
         )
-        _WHISPER_NAME = model_name
-    return _WHISPER
+        _WHISPER_LOAD_S = round(time.perf_counter() - _t, 2)
+        print(f"🎙️ Whisper '{model_name}' loaded in {_WHISPER_LOAD_S}s")
+    return _WHISPER_MODELS[model_name]
+
+
+def _detect_language(audio_path):
+    """Cheap multilingual language detection with the base model. faster-whisper
+    computes info.language EAGERLY (before the lazy segment generator is
+    consumed), so reading it here costs only the first-window encode
+    (~0.3-0.5s), not a full transcription. Returns (lang_code, probability)."""
+    try:
+        model = _get_whisper(LANG_DETECT_MODEL)
+        _segments, info = model.transcribe(audio_path, beam_size=1, language=None)
+        return info.language, round(float(info.language_probability), 3)
+    except Exception as e:
+        print(f"⚠️ language detection failed ({e}); defaulting to en")
+        return "en", 0.0
+
+
+def _make_s3(bucket_override=None):
+    """Env-driven S3/R2 client shared by the transcript-only fast path.
+    OBJECT_STORAGE_ENDPOINT_URL present -> Cloudflare R2; absent -> AWS S3."""
+    import boto3
+    bucket_name = bucket_override or os.environ.get("OBJECT_STORAGE_BUCKET", "logie-users")
+    endpoint_url = os.environ.get("OBJECT_STORAGE_ENDPOINT_URL")
+    if endpoint_url:
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=os.environ["OBJECT_STORAGE_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["OBJECT_STORAGE_SECRET_ACCESS_KEY"],
+            region_name="auto",
+        )
+    else:
+        s3_client = boto3.client('s3')
+    public_base = (
+        os.environ.get("OBJECT_STORAGE_PUBLIC_BASE_URL")
+        or f"https://{bucket_name}.s3.amazonaws.com"
+    ).rstrip('/')
+    return s3_client, bucket_name, public_base
+
+
+def _transcribe_only(request, task_id="", cold=False):
+    """Transcript-only fast path: download staged video -> ffmpeg 16kHz mono
+    audio -> Whisper -> transcript. Skips the whole face/cluster/archive
+    pipeline so the response returns as soon as Whisper finishes. This is what
+    replaces the Groq + Transloadit round-trip and unblocks the LLM brief."""
+    import requests
+    from urllib.parse import quote
+
+    start_perf = time.perf_counter()
+    timings = {}
+    whisper_model_name = request.get("whisper_model", DEFAULT_WHISPER_MODEL)
+    language = request.get("language")
+
+    bucket_override = request.get("bucket")
+    location = (request.get("location") or "").strip().strip("/")
+    source_filename = (request.get("filename") or "").strip().strip("/")
+    video_url = request.get("video_url")
+    if not source_filename and not video_url:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content={
+            "status": "error",
+            "error": "transcript_only needs bucket/location/filename or video_url",
+            "task_id": task_id, "cold": cold,
+        })
+
+    s3_client, bucket_name, public_base = _make_s3(bucket_override)
+
+    # Tolerate a location that repeats the bucket name (copied from the dashboard).
+    if location == bucket_name or location.startswith(bucket_name + "/"):
+        location = location[len(bucket_name):].strip("/")
+    source_key = (f"{location}/{source_filename}" if location else source_filename) if source_filename else None
+    stem = os.path.splitext(source_filename)[0] if source_filename else "video"
+    name_prefix = f"{stem}_" if source_filename else ""
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        audio_path = os.path.join(temp_dir, "audio.wav")
+
+        def _extract_audio(src):
+            # -vn: drop video. reconnect flags make HTTP(S) inputs resilient to
+            # transient drops while streaming from the presigned URL.
+            return subprocess.run(
+                ["ffmpeg", "-y",
+                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                 "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", audio_path],
+                capture_output=True,
+            ).returncode
+
+        # 1+2. Stream audio straight from the source — no full-video download to
+        # disk. The transcript only needs audio, so we presign a GET URL (S3/R2)
+        # and let ffmpeg pull + extract 16kHz mono in ONE overlapped pass. NB: the
+        # separate talent-frames call still downloads the whole video (it needs the
+        # pixels); these are independent invocations so nothing was shared anyway —
+        # this just makes the transcript path lighter and faster.
+        t0 = time.perf_counter()
+        if source_key:
+            try:
+                source_url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": bucket_name, "Key": source_key},
+                    ExpiresIn=600,
+                )
+            except Exception as e:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(status_code=404, content={
+                    "status": "error",
+                    "error": f"Could not presign '{source_key}' in '{bucket_name}': {e}",
+                    "task_id": task_id, "cold": cold,
+                })
+        else:
+            source_url = video_url
+
+        rc = _extract_audio(source_url)
+        streamed_ok = rc == 0 and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024
+        timings["stream_extract"] = round(time.perf_counter() - t0, 2)
+
+        # Fallback: some MP4s (moov atom at the end) don't stream over HTTP —
+        # download the whole file, then extract locally.
+        if not streamed_ok:
+            t0 = time.perf_counter()
+            video_path = os.path.join(temp_dir, "video.mp4")
+            if source_key:
+                try:
+                    s3_client.download_file(bucket_name, source_key, video_path)
+                except Exception as e:
+                    from fastapi.responses import JSONResponse
+                    return JSONResponse(status_code=404, content={
+                        "status": "error",
+                        "error": f"Could not fetch '{source_key}' from bucket '{bucket_name}': {e}",
+                        "task_id": task_id, "cold": cold,
+                    })
+            else:
+                r = requests.get(video_url, stream=True, timeout=60)
+                r.raise_for_status()
+                with open(video_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            rc = _extract_audio(video_path)
+            timings["download_fallback"] = round(time.perf_counter() - t0, 2)
+            if rc != 0 or not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 1024:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(status_code=422, content={
+                    "status": "error",
+                    "error": "No usable audio track to transcribe",
+                    "task_id": task_id, "cold": cold,
+                })
+
+        # 3. Route the model by language: distil (fast) for English, large-v3
+        # (multilingual) for everything else. Skip detection when the caller
+        # already knows the language (pass "language"), or disables it.
+        english_model = whisper_model_name  # the request's preferred/English model
+        multilingual_model = request.get("whisper_model_multilingual", MULTILINGUAL_WHISPER_MODEL)
+        detected_lang = None
+        detected_prob = None
+        if language:
+            lang = language
+        elif request.get("detect_language", True):
+            t0 = time.perf_counter()
+            detected_lang, detected_prob = _detect_language(audio_path)
+            timings["lang_detect"] = round(time.perf_counter() - t0, 2)
+            lang = detected_lang
+        else:
+            lang = "en"
+
+        if lang == "en":
+            chosen_model, tr_language = english_model, "en"
+        else:
+            chosen_model, tr_language = multilingual_model, lang
+
+        # 4. Transcribe with the chosen model. beam_size=1 (greedy): the LLM brief
+        # needs semantic content, not verbatim precision, and greedy is markedly
+        # faster. VAD on to skip silence and suppress silent-gap hallucinations.
+        t0 = time.perf_counter()
+        model = _get_whisper(chosen_model)
+        segments, info = model.transcribe(
+            audio_path, beam_size=1, vad_filter=True, language=tr_language,
+        )
+        entries = []
+        for seg in segments:
+            txt = seg.text.strip()
+            if txt:
+                entries.append({
+                    "start": round(seg.start, 2),
+                    "end": round(seg.end, 2),
+                    "speaker": None,
+                    "text": txt,
+                })
+        timings["whisper"] = round(time.perf_counter() - t0, 2)
+
+        text = " ".join(e["text"] for e in entries).strip()
+        whisper_info = {
+            "model": chosen_model,
+            "language": info.language,
+            "language_probability": round(float(info.language_probability), 3),
+            "detected_language": detected_lang,
+            "detection_probability": detected_prob,
+            "routed": "english" if lang == "en" else "multilingual",
+        }
+
+        # 4. Persist the full transcript.json next to the source (storage mode).
+        transcript_s3_key = None
+        transcript_s3_url = None
+        if entries and source_filename:
+            try:
+                transcript_s3_key = (
+                    f"{location}/{name_prefix}transcript.json" if location else f"{name_prefix}transcript.json"
+                )
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=transcript_s3_key,
+                    Body=json.dumps(
+                        {"source": "whisper", "whisper": whisper_info, "entries": entries},
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    ContentType='application/json',
+                )
+                transcript_s3_url = f"{public_base}/{quote(transcript_s3_key)}"
+            except Exception as e:
+                print(f"⚠️ Transcript upload failed: {e}")
+
+        return {
+            "status": "success",
+            "mode": "transcript",
+            "task_id": task_id,
+            "cold": cold,
+            "model_loaded": True,
+            "enter_seconds": _WHISPER_LOAD_S,
+            "text": text,
+            "transcript_entries": entries,
+            "transcript_metadata": {
+                "source": "whisper",
+                "entries_count": len(entries),
+                "s3_key": transcript_s3_key,
+                "s3_url": transcript_s3_url,
+                "whisper": whisper_info,
+            },
+            "processing_metrics": {
+                "duration_seconds": round(time.perf_counter() - start_perf, 2),
+                "gpu_type": "NVIDIA T4",
+                "timings": timings,
+            },
+        }
+    except Exception as e:
+        print(f"❌ transcript_only ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "task_id": task_id, "cold": cold,
+        })
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # -----------------------------------------------------------------------------
@@ -293,7 +567,9 @@ def process(request: dict) -> dict:
 
     Extra request options (all optional):
       whisper:            "auto" (default: only when no VTT) | "always" | "never"
-      whisper_model:      faster-whisper model name, default "large-v3"
+      whisper_model:      faster-whisper model name, default "large-v3-turbo"
+      transcript_only:    true -> skip the face pipeline, return the transcript
+                          as soon as Whisper finishes (fast path for the brief)
       language:           ISO code hint for Whisper (default: auto-detect)
       max_talent_images:  images per person, default 3 (1-5)
       representative_frames: true/false or a count — defaults to 10 for legacy
@@ -320,6 +596,13 @@ def process(request: dict) -> dict:
     start_perf = time.perf_counter()
     timings = {}
 
+    # Warm/cold + container identity so the API can verify warmth in-band.
+    # _COLD is True only for this container's first real request.
+    task_id = os.environ.get("MODAL_TASK_ID", "")
+    global _COLD
+    cold = _COLD
+    _COLD = False
+
     # 1. HARDWARE CHECK — fail loudly, never silently fall back to CPU
     if os.system("nvidia-smi > /dev/null 2>&1") != 0:
         print("❌ CRITICAL: No GPU attached!")
@@ -334,11 +617,26 @@ def process(request: dict) -> dict:
         t0 = time.perf_counter()
         _get_face_app()
         if request.get("preload_whisper", True):
-            _get_whisper(request.get("whisper_model", "large-v3"))
+            # Preload the English model + the cheap language detector (the common
+            # path). large-v3 loads lazily only when a non-English clip appears.
+            _get_whisper(request.get("whisper_model", DEFAULT_WHISPER_MODEL))
+            _get_whisper(request.get("lang_detect_model", LANG_DETECT_MODEL))
         return {
             "status": "warm",
+            "task_id": task_id,
+            "cold": cold,
+            "model_loaded": len(_WHISPER_MODELS) > 0,
+            "models_loaded": list(_WHISPER_MODELS.keys()),
+            "face_loaded": _FACE_APP is not None,
+            "enter_seconds": _WHISPER_LOAD_S,
             "ready_in_seconds": round(time.perf_counter() - t0, 2),
         }
+
+    # 1c. TRANSCRIPT-ONLY FAST PATH — skip the whole face pipeline so the
+    # response returns the moment Whisper finishes (unblocks the LLM brief).
+    # Talent frames are produced by a separate full call to this endpoint.
+    if request.get("transcript_only") or request.get("mode") == "transcript":
+        return _transcribe_only(request, task_id=task_id, cold=cold)
 
     # 2. PARSE INPUTS (Amazon or Direct)
     metadata = request.get("metadata", {})
@@ -346,7 +644,7 @@ def process(request: dict) -> dict:
     transcript_url = request.get("transcript_url")
 
     whisper_mode = request.get("whisper", "auto")  # auto | always | never
-    whisper_model_name = request.get("whisper_model", "large-v3")
+    whisper_model_name = request.get("whisper_model", DEFAULT_WHISPER_MODEL)
     language = request.get("language")
     max_images = max(1, min(5, int(request.get("max_talent_images", 3))))
 
@@ -857,6 +1155,8 @@ def process(request: dict) -> dict:
         result = {
             "status": "success",
             "job_id": job_id,
+            "task_id": task_id,
+            "cold": cold,
             "date_folder": date_folder,
             "base_path": base_path,
             "metadata": metadata or {},
