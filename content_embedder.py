@@ -281,6 +281,7 @@ def _archive_parquet(key, ok_items, vectors, embedded_at_ts):
             "values": pa.array(vectors, type=pa.list_(pa.float32())),
             "title": [(item.get("title") or "") for item in ok_items],
             "transcript": [item["text"][:TRANSCRIPT_MAX_CHARS] for item in ok_items],
+            "product_anchor": [(item.get("product_anchor") or "") for item in ok_items],
             "is_logie": [bool(item.get("is_logie")) for item in ok_items],
             "metadata": [json.dumps(item.get("metadata") or {}) for item in ok_items],
             "embedded_at_ts": [embedded_at_ts] * len(ok_items),
@@ -339,6 +340,20 @@ class Embedder:
         embedded_at_ts = int(started)
         host = os.environ["PINECONE_CONTENT_HOST"]
 
+        def compose(item):
+            """Dense embed text — anchor-LAST composition (locked 2026-07-13,
+            A/B/C eval: transcript keeps the frame so same-product videos stay
+            distinguishable; the product anchor still adds product/category
+            mass so product-anonymous transcripts become findable). Transcript
+            is pre-cropped BEFORE composing so the anchor always survives —
+            never crop the composed text."""
+            parts = [(item.get("title") or "").strip()]
+            parts.append(f"Transcript: {item['text'][:TRANSCRIPT_MAX_CHARS]}")
+            anchor = (item.get("product_anchor") or "").strip()
+            if anchor:
+                parts.append(anchor)
+            return "\n".join(p for p in parts if p)
+
         direct_bytes = asyncio.run(_fetch_all(items, proxy_url=proxy_url, proxy_mode=proxy_mode))
         fallback_bytes = 0
         fallback_used = 0
@@ -356,10 +371,7 @@ class Embedder:
         ok_items = [item for item in items if item["status"] == "ok"]
 
         if ok_items:
-            texts = [
-                f"Title: {(item.get('title') or '').strip()}\n\nTranscript: {item['text'][:TRANSCRIPT_MAX_CHARS]}"
-                for item in ok_items
-            ]
+            texts = [compose(item) for item in ok_items]
             vectors = self._embed(texts)
             docs = [
                 _build_document(item, vec, embedded_at_ts)
