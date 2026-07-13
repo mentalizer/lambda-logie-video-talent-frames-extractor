@@ -38,6 +38,9 @@ TRANSCRIPT_MAX_CHARS = int(os.environ.get("PINECONE_CONTENT_TRANSCRIPT_MAX_CHARS
 # Amazon's public media CDN, not our own infra. Override via the pinecone-content
 # secret if we ever see throttling.
 FETCH_CONCURRENCY = int(os.environ.get("CONTENT_FETCH_CONCURRENCY", "12"))
+# Paid-proxy (Oxylabs) second pass runs gentler — it only handles the throttled
+# remainder and we don't want to burn the 8GB/mo cap or hammer the unblocker.
+FALLBACK_CONCURRENCY = int(os.environ.get("CONTENT_FALLBACK_CONCURRENCY", "6"))
 FETCH_TIMEOUT_SECS = 20
 FETCH_RETRIES = 3
 FETCH_USER_AGENT = os.environ.get(
@@ -104,31 +107,34 @@ def _parse_vtt(vtt_text):
     return " ".join(lines).strip()
 
 
-async def _fetch_all(items, proxy_url=None):
+async def _fetch_all(items, proxy_url=None, proxy_mode="standard", concurrency=None):
     """Fetch + parse every item's transcript_url concurrently.
-    Mutates each item: adds `text` and `status` ('ok'|'empty'|'fetch_failed').
+    Mutates each item: adds `text`, `status` ('ok'|'empty'|'fetch_failed') and
+    `_bytes`. Returns total bytes downloaded (for bandwidth accounting).
 
-    When proxy_url is set the fetch goes through it (e.g. ScrapingDog:
-    http://scrapingdog:<key>@proxy.scrapingdog.com:8081). Direct fetches from a
-    single Modal container IP get soft-throttled by Amazon's CDN with 200-empty
-    bodies once volume is high; a rotating proxy exits from a fresh IP per
-    request and returns the real transcript. ScrapingDog proxy mode wants the
-    http:// form of the target with TLS verification off (matches the proven
-    etl/repair_amazon_video_air_dates.py pattern)."""
+    Direct fetches from a single Modal container IP get soft-throttled by
+    Amazon's CDN with 200-empty bodies at volume; a rotating proxy exits from a
+    fresh IP per request and returns the real transcript.
+      proxy_mode='standard'   -> Oxylabs-style CONNECT proxy: keep https, verify on
+      proxy_mode='scrapingdog'-> ScrapingDog proxy: http:// target + verify off
+    """
     import asyncio
     import random
 
     import httpx
 
-    sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+    sem = asyncio.Semaphore(concurrency or FETCH_CONCURRENCY)
     use_proxy = bool(proxy_url)
+    flip_http = use_proxy and proxy_mode == "scrapingdog"
+    total_bytes = 0
 
     def target(u):
-        if use_proxy and u.startswith("https://"):
+        if flip_http and u.startswith("https://"):
             return "http://" + u[len("https://"):]
         return u
 
     async def fetch_one(client, item):
+        nonlocal total_bytes
         url = (item.get("transcript_url") or "").strip()
         if not url:
             item["status"], item["text"] = "empty", ""
@@ -138,6 +144,7 @@ async def _fetch_all(items, proxy_url=None):
                 try:
                     resp = await client.get(target(url), timeout=FETCH_TIMEOUT_SECS)
                     if resp.status_code == 200:
+                        total_bytes += len(resp.content)
                         text = _parse_vtt(resp.text)
                         if text:
                             item["status"], item["text"] = "ok", text
@@ -170,9 +177,15 @@ async def _fetch_all(items, proxy_url=None):
     client_kwargs = dict(follow_redirects=True, headers=headers)
     if use_proxy:
         client_kwargs["proxy"] = proxy_url
-        client_kwargs["verify"] = False
+        # unblocker/scrapingdog MITM TLS (their cert won't match the target),
+        # so skip verification; a plain residential CONNECT proxy keeps it on.
+        client_kwargs["verify"] = proxy_mode == "standard"
+        # Force a fresh connection per request so a rotating residential proxy
+        # hands out a new exit IP each time (keep-alive would pin one IP).
+        client_kwargs["limits"] = httpx.Limits(max_keepalive_connections=0)
     async with httpx.AsyncClient(**client_kwargs) as client:
         await asyncio.gather(*(fetch_one(client, item) for item in items))
+    return total_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -310,15 +323,36 @@ class Embedder:
         # round to shrink JSON payloads; harmless for cosine at fp16 precision
         return [[round(float(x), 6) for x in vec] for vec in vectors]
 
-    def _process(self, items, archive_key, dry_run=False, ns_all=NAMESPACE_ALL, ns_logie=NAMESPACE_LOGIE, debug=False, proxy_url=None):
-        """The single shared pipeline: fetch -> parse -> embed -> upsert -> archive."""
+    def _process(self, items, archive_key, dry_run=False, ns_all=NAMESPACE_ALL, ns_logie=NAMESPACE_LOGIE,
+                 debug=False, proxy_url=None, proxy_mode="standard",
+                 fallback_proxy_url=None, fallback_mode="standard"):
+        """The single shared pipeline: fetch -> parse -> embed -> upsert -> archive.
+
+        Two-pass fetch to minimize paid proxy bandwidth: pass 1 uses proxy_url
+        (usually None = Modal direct, free); anything that comes back empty or
+        failed — i.e. what Amazon's CDN throttled — is re-fetched in pass 2
+        through fallback_proxy_url (Oxylabs, paid, rotating). Only the throttled
+        remainder ever costs bandwidth."""
         import asyncio
 
         started = time.time()
         embedded_at_ts = int(started)
         host = os.environ["PINECONE_CONTENT_HOST"]
 
-        asyncio.run(_fetch_all(items, proxy_url=proxy_url))
+        direct_bytes = asyncio.run(_fetch_all(items, proxy_url=proxy_url, proxy_mode=proxy_mode))
+        fallback_bytes = 0
+        fallback_used = 0
+        if fallback_proxy_url:
+            retry = [it for it in items if it["status"] in ("empty", "fetch_failed")]
+            if retry:
+                fallback_used = len(retry)
+                for it in retry:
+                    it.pop("status", None)
+                    it.pop("text", None)
+                fallback_bytes = asyncio.run(
+                    _fetch_all(retry, proxy_url=fallback_proxy_url, proxy_mode=fallback_mode,
+                               concurrency=FALLBACK_CONCURRENCY)
+                )
         ok_items = [item for item in items if item["status"] == "ok"]
 
         if ok_items:
@@ -369,6 +403,9 @@ class Embedder:
             "logie_docs": sum(1 for item in ok_items if item.get("is_logie")),
             "duration_secs": round(time.time() - started, 2),
             "dry_run": dry_run,
+            "direct_bytes": direct_bytes,
+            "fallback_used": fallback_used,      # items re-fetched via paid proxy
+            "fallback_bytes": fallback_bytes,    # paid proxy bandwidth this shard
         }
         if debug:
             if getattr(self, "_debug_doc", None):
@@ -409,6 +446,9 @@ class Embedder:
             ns_logie=ns_logie,
             debug=bool(payload.get("debug")),
             proxy_url=payload.get("proxy_url") or None,
+            proxy_mode=payload.get("proxy_mode") or "standard",
+            fallback_proxy_url=payload.get("fallback_proxy_url") or None,
+            fallback_mode=payload.get("fallback_mode") or "unblocker",
         )
 
     @modal.fastapi_endpoint(method="POST")
@@ -427,11 +467,14 @@ class Embedder:
         return {"vector": vector, "model": "bge-m3", "dimension": len(vector)}
 
     @modal.method()
-    def backfill_shard(self, shard_key: str, proxy_url: str = None):
+    def backfill_shard(self, shard_key: str, fallback_proxy_url: str = None,
+                       fallback_mode: str = "standard"):
         """Process one JSONL shard from R2 (one item per line). Idempotent:
         skips if the results file already exists (safe fan-out resume).
-        proxy_url (e.g. ScrapingDog) is applied to all transcript fetches —
-        required at scale so Amazon's CDN doesn't soft-throttle a container IP."""
+
+        Pass 1 fetches direct from Modal's IP (free). Whatever Amazon throttles
+        (200-empty) is re-fetched through fallback_proxy_url (Oxylabs, paid) so
+        we only spend proxy bandwidth on the blocked remainder."""
         bucket = os.environ.get("OBJECT_STORAGE_BUCKET", "logie-users")
         results_key = shard_key.replace("/shards/", "/results/") + ".results.json"
         r2 = _get_r2_client()
@@ -445,7 +488,11 @@ class Embedder:
         items = [json.loads(line) for line in body.splitlines() if line.strip()]
         shard_name = shard_key.rsplit("/", 1)[-1].replace(".jsonl", "")
         archive_key = f"{ARCHIVE_PREFIX}/backfill/{shard_name}.parquet"
-        outcome = self._process(items, archive_key, proxy_url=proxy_url or None)
+        outcome = self._process(
+            items, archive_key,
+            fallback_proxy_url=fallback_proxy_url or None,
+            fallback_mode=fallback_mode,
+        )
         outcome["shard"] = shard_key
         r2.put_object(Bucket=bucket, Key=results_key, Body=json.dumps(outcome).encode("utf-8"))
         return outcome
@@ -472,18 +519,24 @@ def list_shards(prefix: str):
 
 
 @app.local_entrypoint()
-def backfill(prefix: str = "content-vectors/backfill/shards/", proxy_url: str = ""):
-    # Proxy resolved on the client side and passed to every shard so the creds
-    # never live in a Modal secret or in R2. Set CONTENT_FETCH_PROXY_URL in the
-    # shell (from api.config scrapingdog.proxy.config) before `modal run`.
-    proxy_url = proxy_url or os.environ.get("CONTENT_FETCH_PROXY_URL", "")
+def backfill(prefix: str = "content-vectors/backfill/shards/",
+             fallback_proxy_url: str = "", fallback_mode: str = "standard"):
+    # Two-pass: Modal fetches direct (free); the throttled remainder is re-fetched
+    # through the Oxylabs fallback. The fallback URL is resolved client-side and
+    # passed per shard so creds never live in a Modal secret or in R2. Set
+    # CONTENT_FALLBACK_PROXY_URL in the shell (built from OXYLABS_* in .env)
+    # before `modal run`.
+    fallback_proxy_url = fallback_proxy_url or os.environ.get("CONTENT_FALLBACK_PROXY_URL", "")
     shard_keys = list_shards.remote(prefix)
-    print(f"{len(shard_keys)} shards under {prefix} | proxy={'on' if proxy_url else 'OFF'}")
+    print(f"{len(shard_keys)} shards under {prefix} | fallback={'Oxylabs' if fallback_proxy_url else 'OFF'}")
     embedder = Embedder()
     done = failed = 0
     totals = {}
+    fb_bytes = fb_used = 0
     for outcome in embedder.backfill_shard.map(
-        shard_keys, kwargs={"proxy_url": proxy_url}, return_exceptions=True
+        shard_keys,
+        kwargs={"fallback_proxy_url": fallback_proxy_url, "fallback_mode": fallback_mode},
+        return_exceptions=True,
     ):
         if isinstance(outcome, Exception):
             failed += 1
@@ -493,6 +546,10 @@ def backfill(prefix: str = "content-vectors/backfill/shards/", proxy_url: str = 
         if not outcome.get("skipped"):
             for k, v in (outcome.get("counts") or {}).items():
                 totals[k] = totals.get(k, 0) + v
+            fb_bytes += outcome.get("fallback_bytes") or 0
+            fb_used += outcome.get("fallback_used") or 0
         tag = "skipped" if outcome.get("skipped") else outcome.get("counts")
         print(f"[{done}/{len(shard_keys)}] {outcome['shard']}: {tag}")
     print(f"done={done} failed={failed} totals={totals}")
+    print(f"Oxylabs fallback: {fb_used} items, {fb_bytes/1e6:.1f} MB  "
+          f"(8GB/mo cap → this run used {fb_bytes/8e9*100:.2f}% of it)")
