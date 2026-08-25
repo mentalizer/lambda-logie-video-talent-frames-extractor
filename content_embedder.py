@@ -107,6 +107,28 @@ def _parse_vtt(vtt_text):
     return " ".join(lines).strip()
 
 
+def _promote_title_fallbacks(items):
+    """Make transcript failure non-terminal when useful title text exists.
+
+    Transcript fetching is enrichment. Amazon can return an empty/dead VTT
+    even though the catalog video and its title are valid. After all configured
+    fetch attempts are exhausted, preserve the fetch outcome for diagnostics
+    and let the normal embedding path create a title/product-anchor vector.
+    """
+    promoted = 0
+    for item in items:
+        if item.get("status") == "ok":
+            continue
+        if not ((item.get("title") or "").strip() or (item.get("product_anchor") or "").strip()):
+            continue
+        item["transcript_status"] = item.get("status") or "unavailable"
+        item["transcript_error"] = item.get("error")
+        item["status"] = "ok"
+        item["text"] = ""
+        promoted += 1
+    return promoted
+
+
 async def _fetch_all(items, proxy_url=None, proxy_mode="standard", concurrency=None):
     """Fetch + parse every item's transcript_url concurrently.
     Mutates each item: adds `text`, `status` ('ok'|'empty'|'fetch_failed') and
@@ -373,6 +395,7 @@ class Embedder:
                     _fetch_all(retry, proxy_url=fallback_proxy_url, proxy_mode=fallback_mode,
                                concurrency=FALLBACK_CONCURRENCY)
                 )
+        title_fallbacks = _promote_title_fallbacks(items)
         ok_items = [item for item in items if item["status"] == "ok"]
 
         if ok_items:
@@ -423,6 +446,7 @@ class Embedder:
             "direct_bytes": direct_bytes,
             "fallback_used": fallback_used,      # items re-fetched via paid proxy
             "fallback_bytes": fallback_bytes,    # paid proxy bandwidth this shard
+            "title_fallbacks": title_fallbacks,
         }
         if debug:
             if getattr(self, "_debug_doc", None):
