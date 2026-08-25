@@ -137,7 +137,10 @@ async def _fetch_all(items, proxy_url=None, proxy_mode="standard", concurrency=N
         nonlocal total_bytes
         url = (item.get("transcript_url") or "").strip()
         if not url:
-            item["status"], item["text"] = "empty", ""
+            # A transcript is enrichment, not eligibility. Title/product-anchor
+            # text still gives semantic search a useful vector, and it avoids a
+            # pointless paid-proxy retry for an absent URL.
+            item["status"], item["text"] = "ok", ""
             return
         async with sem:
             for attempt in range(FETCH_RETRIES + 1):
@@ -348,7 +351,9 @@ class Embedder:
             is pre-cropped BEFORE composing so the anchor always survives —
             never crop the composed text."""
             parts = [(item.get("title") or "").strip()]
-            parts.append(f"Transcript: {item['text'][:TRANSCRIPT_MAX_CHARS]}")
+            transcript = item["text"][:TRANSCRIPT_MAX_CHARS].strip()
+            if transcript:
+                parts.append(f"Transcript: {transcript}")
             anchor = (item.get("product_anchor") or "").strip()
             if anchor:
                 parts.append(anchor)
